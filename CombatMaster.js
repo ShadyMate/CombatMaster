@@ -1,21 +1,53 @@
 /*
- * Version 2.49
+ * Version 2.50 (D&D 2024 / Beacon sheet update)
  * Original By Robin Kuiper
  * Changes in Version 0.3.0 and greater by Victor B
  * Changes in this version and prior versions by The Aaron
  * Discord: Vic#5196H
  * Roll20: https://app.roll20.net/users/3135709/victor-b
  * Github: https://github.com/vicberg/CombatMaster
+ *
+ * ---------------------------------------------------------------------------
+ * 2.50 CHANGES
+ * ---------------------------------------------------------------------------
+ * D&D 2024 (Beacon) support:
+ *   - Character values are read with the new async getSheetItem() API, with
+ *     getComputed() and getAttrByName() as fallbacks. This works for the
+ *     D&D 2014 sheet AND the D&D 2024 sheet.
+ *   - IMPORTANT: For Beacon sheets (D&D 2024) set
+ *     Game Settings > API Scripts > Sandbox to "Experimental" and restart.
+ *     Check that the restart log says EXPERIMENTAL.
+ *   - Initiative is awaited before combat starts, so the turn order is ready.
+ *   - Group-Init waits for GroupInitiative (which is async now) to finish.
+ *   - Spell detection for the 2024 sheet ("advancedroll" chat cards).
+ *     New Sheet options: "Auto" (2014 + 2024) and "DnD2024".
+ *   - Concentration checks read the save bonus from the sheet (2014 or 2024)
+ *     and use the 2024 rule (DC 10 or half damage, max 30).
+ * Fixes:
+ *   - Turn marker graphics are tracked by id (no more duplicate markers, and
+ *     adding a condition outside combat no longer puts the marker in the tracker).
+ *   - Status markers are matched exactly ("red" no longer matches other names).
+ *   - Removing conditions no longer removes the wrong entry.
+ *   - Wound bar setting "Bar1" never fired; all bars are now watched.
+ *   - Number settings (die, marker size, timer) are stored as numbers.
+ *   - Renaming a condition to the same name with other casing no longer deletes it.
+ *   - Spells saved for "Add Spell" survive a sandbox restart.
+ *   - Many small crash guards (missing tokens, handouts, macros, characters).
+ *   - Whispers to players with spaces in their name now work.
+ *   - Setup commands (config, reset, import, delete) are GM only.
+ *   - Underscore.js is no longer required.
+ * ---------------------------------------------------------------------------
 */
 var CombatMaster = CombatMaster || (function() {
     'use strict';
 
     let round = 1,
-	    version = '2.49',
+	    version = '2.50',
         timerObj,
         intervalHandle,
         animationHandle,
-        debug = true,
+        debug = false,
+        markerWarned = false,
         paused = false,
         who = 'gm',
         playerID = null,
@@ -104,25 +136,188 @@ var CombatMaster = CombatMaster || (function() {
     script_name = 'CombatMaster',
     combatState = 'COMBATMASTER',
 
+    // Sheet names (character.charactersheetname) that are built on Beacon
+    beaconSheetNames = ['dnd2024byroll20'],
+    defaultMarkerURLs = {
+        current: 'https://s3.amazonaws.com/files.d20.io/images/52550079/U-3U950B3wk_KRtspSPyuw/thumb.png?1524507826',
+        next: 'https://s3.amazonaws.com/files.d20.io/images/66352183/90UOrT-_Odg2WvvLbKOthw/thumb.png?1541422636'
+    },
+    warnedCharacters = {},
+    recentSpellCasts = {},
+    nullMarker = {
+        id: '',
+        isNull: true,
+        get: function (key) { return (key === 'id' || key === '_id') ? '' : undefined },
+        set: function () {},
+        remove: function () {}
+    },
+
+//*************************************************************************************************************
+//SHEET ACCESS (Legacy sheets like D&D 2014 and Beacon sheets like D&D 2024)
+//*************************************************************************************************************
+    reportError = function (where, err) {
+        let text = (err && err.message) ? err.message : String(err)
+        log(script_name + ' error in ' + where + ': ' + text)
+        if (err && err.stack && debug) {
+            log(err.stack)
+        }
+    },
+
+    isBeaconCharacter = function (characterObj) {
+        if (!characterObj) {
+            return false
+        }
+        let sheetName = String(characterObj.get('charactersheetname') || '').toLowerCase()
+        return beaconSheetNames.includes(sheetName)
+    },
+
+    isEmptyValue = function (value) {
+        if (value === null || typeof value === 'undefined' || value === '') {
+            return true
+        }
+        return (typeof value === 'object' && Object.keys(value).length === 0)
+    },
+
+    // Reads a value from any sheet. Always returns a Promise.
+    getSheetValue = async function (characterId, name, type) {
+        let value
+        type = type || 'current'
+        name = String(name || '').trim()
+
+        if (!characterId || !name || name === 'None') {
+            return undefined
+        }
+
+        if (typeof getSheetItem === 'function') {
+            try {
+                value = await getSheetItem(characterId, name, type)
+            } catch (err) {
+                if (debug) {
+                    reportError('getSheetItem(' + name + ')', err)
+                }
+            }
+        }
+
+        if (isEmptyValue(value) && type === 'current' && typeof getComputed === 'function') {
+            try {
+                value = await getComputed({characterId: characterId, property: name})
+            } catch (err) {
+                if (debug) {
+                    reportError('getComputed(' + name + ')', err)
+                }
+            }
+        }
+
+        if (isEmptyValue(value) && typeof getAttrByName === 'function') {
+            try {
+                value = getAttrByName(characterId, name, type)
+            } catch (err) {
+                if (debug) {
+                    reportError('getAttrByName(' + name + ')', err)
+                }
+            }
+        }
+
+        if (value && typeof value === 'object') {
+            if (typeof value.value !== 'undefined') {
+                value = value.value
+            } else if (typeof value.current !== 'undefined') {
+                value = value.current
+            } else if (typeof value.total !== 'undefined') {
+                value = value.total
+            }
+        }
+
+        return isEmptyValue(value) ? undefined : value
+    },
+
+    getSheetNumber = async function (characterId, name, type) {
+        let value = await getSheetValue(characterId, name, type)
+        let number = parseFloat(value)
+        return Number.isFinite(number) ? number : undefined
+    },
+
+    warnMissingAttributes = function (characterObj, missing) {
+        if (!characterObj || warnedCharacters[characterObj.id]) {
+            return
+        }
+        warnedCharacters[characterObj.id] = true
+
+        let text = 'Could not read <b>' + HE(missing.join(', ')) + '</b> from <b>' + HE(characterObj.get('name') || '') + '</b>. Using 0 instead.'
+        if (isBeaconCharacter(characterObj)) {
+            text += '<br><br>This character uses the <b>D&amp;D 2024</b> sheet. Set the API Sandbox to <b>Experimental</b> in the game settings and restart the sandbox.'
+        }
+        makeAndSendMenu(text, 'Sheet Warning', 'gm')
+    },
+
+    firstMatch = function (content, patterns) {
+        let i, match
+        content = String(content || '')
+        for (i = 0; i < patterns.length; i++) {
+            match = content.match(patterns[i])
+            if (match && match[1]) {
+                return match[1].trim()
+            }
+        }
+        return undefined
+    },
+
+    stripHTML = function (html) {
+        return String(html || '')
+            .replace(/<br\s*\/?>/gi, '\n')
+            .replace(/<\/(div|p|li|h\d)>/gi, '\n')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/&#39;|&apos;/g, "'")
+            .replace(/&quot;/g, '"')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&')
+            .replace(/[ \t]+/g, ' ')
+            .replace(/\s*\n\s*/g, '\n')
+            .trim()
+    },
+
+    waitForTurnorder = function (timeout) {
+        timeout = timeout || 10000
+        return new Promise(resolve => {
+            let waited = 0
+            let check = () => {
+                if (getTurnorder().length > 0) {
+                    // give the other script a moment to finish sorting
+                    setTimeout(() => resolve(true), 500)
+                    return
+                }
+                if (waited >= timeout) {
+                    resolve(false)
+                    return
+                }
+                waited += 250
+                setTimeout(check, 250)
+            }
+            check()
+        })
+    },
+
     inputHandler = function(msg_orig) {
+        if (!msg_orig || typeof msg_orig.content !== 'string') {
+            return
+        }
 
         let status = state[combatState].config.status
-        if (status.autoAddSpells) {
-            if (status.sheet == 'OGL') {
-                if (msg_orig && (msg_orig.rolltemplate && msg_orig.rolltemplate === 'spell') ) {
-                    if (debug) {
-                        log(msg_orig)
-                    }
-                    handleSpellCast(msg_orig)
+        if (status.autoAddSpells && msg_orig.playerid !== 'API') {
+            try {
+                if ((status.sheet == 'OGL' || status.sheet == 'Auto') && msg_orig.rolltemplate === 'spell') {
+                    handleSpellCast(msg_orig, 'OGL')
+                } else if (status.sheet == 'Shaped' && msg_orig.content.includes("{{spell=1}}")) {
+                    handleSpellCast(msg_orig, 'Shaped')
+                } else if (status.sheet == 'PF2' && msg_orig.content.includes("{cast}")) {
+                    handleSpellCast(msg_orig, 'PF2')
+                } else if ((status.sheet == 'DnD2024' || status.sheet == 'Auto') && msg_orig.type === 'advancedroll') {
+                    handleSpellCast(msg_orig, 'DnD2024')
                 }
-            } else if (status.sheet == 'Shaped')  {
-                if (msg_orig && msg_orig.content.includes("{{spell=1}}")) {
-                    handleSpellCast(msg_orig)
-                }
-            }  else if (status.sheet == 'PF2')  {
-                if (msg_orig && msg_orig.content.includes("{cast}")) {
-                    handleSpellCast(msg_orig)
-                }
+            } catch (err) {
+                reportError('Spell Detection', err)
             }
         }
 
@@ -130,17 +325,23 @@ var CombatMaster = CombatMaster || (function() {
             return;
         }
 
-        var msg = _.clone(msg_orig),args,restrict,player
+        let msg = Object.assign({}, msg_orig),args,restrict
 
         playerID = msg.playerid
-        if (playerIsGM(msg.playerid)) {
-              state[combatState].config.gmPlayerID = msg.playerid
-              who = 'gm'
+        if (msg.playerid === 'API' || playerIsGM(msg.playerid)) {
+            if (msg.playerid !== 'API') {
+                state[combatState].config.gmPlayerID = msg.playerid
+            }
+            who = 'gm'
         } else {
-            who = getObj('player', msg.playerid).get('displayname');
+            let playerObj = getObj('player', msg.playerid)
+            if (!playerObj) {
+                return
+            }
+            who = playerObj.get('displayname');
         }
 
-		if(_.has(msg,'inlinerolls')) {//calculates inline rolls
+		if(Array.isArray(msg.inlinerolls) && msg.inlinerolls.length) {//calculates inline rolls
 			msg.content = inlineExtract(msg);
 		}
 
@@ -149,38 +350,40 @@ var CombatMaster = CombatMaster || (function() {
 	        details: {}
 	    }
 
-        if (msg.content.indexOf('import') >= 0) {
-            cmdDetails.action = 'import'
-            msg.content = msg.content.replace('!cmaster ','')
-            cmdDetails.details['config'] = msg.content.replace('--import,','')
-            commandHandler(cmdDetails,msg,restrict,who,playerID)
-        } else {
-    		args = msg.content.split(/\s+--/);
-    	    if(args[0] === '!cmaster'){
-                if(args[1]){
-                    _.each(_.rest(args,1),(cmd) =>{
-                        cmdDetails = cmdExtract(cmd);
-                        if (debug){
-                            log(cmdDetails)
-                        }
-                        commandHandler(cmdDetails,msg,restrict,who,playerID)
-                    })
-                }
-        	}
+        try {
+            if (/\s--import[,\s]/.test(msg.content)) {
+                cmdDetails.action = 'import'
+                msg.content = msg.content.replace('!cmaster ','')
+                cmdDetails.details['config'] = msg.content.replace('--import,','')
+                commandHandler(cmdDetails,msg,restrict,who,playerID)
+            } else {
+        		args = msg.content.split(/\s+--/);
+        	    if(args[0] === '!cmaster'){
+                    if(args[1]){
+                        args.slice(1).forEach((cmd) => {
+                            cmdDetails = cmdExtract(cmd);
+                            if (debug){
+                                log(cmdDetails)
+                            }
+                            commandHandler(cmdDetails,msg,restrict,who,playerID)
+                        })
+                    } else {
+                        sendMainMenu(who)
+                    }
+            	}
+            }
+        } catch (err) {
+            reportError('Command', err)
+            makeAndSendMenu('Something went wrong. Check the API console log for details.', 'CombatMaster Error', 'gm')
         }
 	},
 
 	//Extracts inline rolls
 	inlineExtract = function(msg){
-	    return _.chain(msg.inlinerolls)
-				.reduce(function(m,v,k){
-					m['$[['+k+']]']=v.results.total || 0;
-					return m;
-				},{})
-				.reduce(function(m,v,k){
-					return m.replace(k,v);
-				},msg.content)
-				.value();
+	    return (msg.inlinerolls || []).reduce((content, roll, index) => {
+	        let total = (roll && roll.results && roll.results.total) || 0
+	        return content.split('$[['+index+']]').join(total)
+	    }, msg.content)
 	},
 
     //Extracts the command details from a command string passed from handleInput
@@ -191,9 +394,9 @@ var CombatMaster = CombatMaster || (function() {
 	    vars,
 	    temp,
 	    details;
-//	    if (debug) {
+	    if (debug) {
             log(cmd)
-//	    }
+	    }
         //special handling of import is required
 
         let values = parseLine(cmd)
@@ -210,7 +413,7 @@ var CombatMaster = CombatMaster || (function() {
         cmd.replace('./', '');
 
         //split additional command actions
-	    _.each(String(tokens).replace(cmdSep.action+',','').split(','),(d) => {
+	    String(tokens).replace(cmdSep.action+',','').split(',').forEach((d) => {
             vars=d.match(/(who|next|main|previous|delay|start|stop|hold|timer|pause|show|all|favorites|setup|conditions|condition|sort|combat|turnorder|accouncements|timer|macro|status|list|export|import|type|key|value|setup|tracker|confirm|direction|duration|message|initiative|config|assigned|type|action|description|target|id|started|stopped|held|addAPI|remAPI|concentration|view|)(?:\:|=)([^,]+)/) || null;
             if(vars) {
                 if (vars[2].includes('INDEX')) {
@@ -275,6 +478,16 @@ var CombatMaster = CombatMaster || (function() {
 	        log (cmdDetails.action)
 	    }
 
+        const gmOnlyActions = ['config','new','delete','import','reset','ignore','spell','clear','export']
+        if (who != 'gm' && gmOnlyActions.includes(String(cmdDetails.action))) {
+            makeAndSendMenu('Only the GM can use this command.', 'CombatMaster', who)
+            return
+        }
+        if (who != 'gm' && cmdDetails.action == 'turn' && (cmdDetails.details.start || cmdDetails.details.stop || cmdDetails.details.hold || cmdDetails.details.sort)) {
+            makeAndSendMenu('Only the GM can start, stop or hold combat.', 'CombatMaster', who)
+            return
+        }
+
         if (cmdDetails.action == 'back'){
             if (cmdDetails.details.setup) {
                 cmdDetails.action = 'show'
@@ -306,7 +519,7 @@ var CombatMaster = CombatMaster || (function() {
                 previousTurn()
             }
             if (cmdDetails.details.start) {
-                startCombat(msg.selected, who);
+                startCombat(msg.selected, who).catch(err => reportError('Start Combat', err));
             }
             if (cmdDetails.details.stop) {
                 stopCombat(who);
@@ -646,13 +859,13 @@ var CombatMaster = CombatMaster || (function() {
 
         if (initiative.rollInitiative == 'CombatMaster') {
             listItems.push(makeTextButton('Initiative Attr', initiative.initiativeAttributes, '!cmaster --config,initiative,key=initiativeAttributes,value=?{Attribute|'+initiative.initiativeAttributes+'} --show,initiative'))
-            listItems.push(makeTextButton('Initiative Die', 'd' + initiative.initiativeDie, '!cmaster --config,initiative,key=initiativeDie,value=?{Die (without the d)'+initiative.initiativeDie+'} --show,initiative'))
+            listItems.push(makeTextButton('Initiative Die', 'd' + initiative.initiativeDie, '!cmaster --config,initiative,key=initiativeDie,value=?{Die (without the d)|'+initiative.initiativeDie+'} --show,initiative'))
             listItems.push(makeTextButton('Show Initiative in Chat', initiative.showInitiative, '!cmaster --config,initiative,key=showInitiative,value='+!initiative.showInitiative + ' --show,initiative'))
         }
 
 		if (initiative.rollInitiative == 'Group-Init') {
 			listItems.push(makeTextButton('Target Tokens', initiative.apiTargetTokens, '!cmaster --config,initiative,key=apiTargetTokens,value=?{Target Tokens|} --show,initiative'))
-            if (!initiative.apiTargetTokens > '') {
+            if (initiative.apiTargetTokens && initiative.apiTargetTokens !== 'None') {
                 listItems.push('<div>'+initiative.apiTargetTokens+'</div>')
             }
 		}
@@ -783,7 +996,7 @@ var CombatMaster = CombatMaster || (function() {
 		]
 
         if (status.autoAddSpells) {
-            listItems.push(makeTextButton('Sheet', status.sheet, '!cmaster --config,status,key=sheet,value=?{Sheet|D&D5E OGL,OGL|D&D5E Shaped,Shaped|PF2,PF2|} --show,status'))
+            listItems.push(makeTextButton('Sheet', status.sheet, '!cmaster --config,status,key=sheet,value=?{Sheet|Auto (D&D 2014 and 2024),Auto|D&D 2024,DnD2024|D&D5E OGL (2014),OGL|D&D5E Shaped,Shaped|PF2,PF2} --show,status'))
         }
 
 		makeAndSendMenu(makeList(listItems,banner.backButton),banner.titleText,'gm');
@@ -804,7 +1017,7 @@ var CombatMaster = CombatMaster || (function() {
 
 		if (concentration.autoRoll) {
 		    listItems.push(makeTextButton('Wound Bar', concentration.woundBar, '!cmaster --config,concentration,key=woundBar,value=?{Wound Bar|Bar1,bar1|Bar2,bar2|Bar3,bar3} --show,concentration'))
-		    listItems.push(makeTextButton('Attribute', concentration.attribute, '!cmaster --config,concentration,key=attribute,value=?{Attribute|} --show,concentration'))
+		    listItems.push(makeTextButton('Attribute', concentration.attribute, '!cmaster --config,concentration,key=attribute,value=?{Save bonus attribute|'+concentration.attribute+'} --show,concentration'))
 
 		}
 
@@ -846,9 +1059,10 @@ var CombatMaster = CombatMaster || (function() {
             listItems.push(listContents);
 
             if(check && icons.includes(condition.icon)){
-                message = message || '' + '<br>Multiple conditions use the same icon';
+                message = (message || '') + '<br>Multiple conditions use the same icon';
                 check = false;
             }
+            icons.push(condition.icon)
         }
 
         message = (message) ? '<p style="color: red">'+message+'</p>' : '';
@@ -964,7 +1178,7 @@ var CombatMaster = CombatMaster || (function() {
         if (selectedTokens) {
             selectedTokens.forEach(token => {
                 if (token._type == 'graphic') {
-                    if (token._id != getOrCreateMarker(false).get('id') && token._id != getOrCreateMarker(true).get('id')) {
+                    if (!isTurnMarkerId(token._id)) {
                         announcePlayer(getObj('graphic', token._id), false, false, true);
                     }
                 }
@@ -976,13 +1190,18 @@ var CombatMaster = CombatMaster || (function() {
         let json
         let backButton = makeBigButton('Back', '!cmaster --back,setup');
 
-        json = JSON.parse(config.replace('config=',''));
+        try {
+            json = JSON.parse(String(config || '').replace('config=',''));
+        } catch (err) {
+            makeAndSendMenu('The import text is not valid. Copy the complete export text and try again.' + backButton, 'Import Setup', 'gm');
+            return
+        }
         if (['cmaster','cm'].includes(json.command)) {
             state[combatState].config = json
             state[combatState].conditions = [];
             setDefaults()
             makeAndSendMenu('Current Combat Master detected and imported.' + backButton, 'Import Setup');
-        } else if (json.config.command == 'condition') {
+        } else if (json.config && json.config.command == 'condition') {
             state[combatState].config.conditions = json.conditions
             setDefaults()
             makeAndSendMenu('Prior Combat Tracker detected and conditions were imported.' + backButton, 'Import Setup');
@@ -1035,39 +1254,63 @@ var CombatMaster = CombatMaster || (function() {
 //SESSION STATE MAINTENANCE
 //*************************************************************************************************************
 	editCombatState = function (cmdDetails) {
-		if(cmdDetails.details.initiative){
-			state[combatState].config.initiative[cmdDetails.details.key] = cmdDetails.details.value;
+	    const numberKeys = ['initiativeDie','markerSize','animateMarkerDegree','animateMarkerWait','time','timerFontSize']
+	    let details    = cmdDetails.details
+	    let conditions = state[combatState].config.conditions
+
+	    if (numberKeys.includes(details.key) && !details.condition) {
+	        let number = parseFloat(details.value)
+	        if (!Number.isFinite(number)) {
+	            makeAndSendMenu('"' + HE(String(details.value)) + '" is not a number.', 'Setup', 'gm')
+	            return
+	        }
+	        details.value = number
+	    }
+	    if (details.key === 'woundBar') {
+	        details.value = String(details.value).toLowerCase()
+	    }
+
+		if(details.initiative){
+			state[combatState].config.initiative[details.key] = details.value;
 		}
-		else if(cmdDetails.details.timer){
-			state[combatState].config.timer[cmdDetails.details.key] = cmdDetails.details.value;
+		else if(details.timer){
+			state[combatState].config.timer[details.key] = details.value;
 		}
-		else if (cmdDetails.details.turnorder){
-			if (cmdDetails.details.key === 'initiativeDie') {
-				cmdDetails.details.value = parseInt(value);
-			}
-			state[combatState].config.turnorder[cmdDetails.details.key] = cmdDetails.details.value;
+		else if (details.turnorder){
+			state[combatState].config.turnorder[details.key] = details.value;
 		}
-		else if (cmdDetails.details.announcements){
-			state[combatState].config.announcements[cmdDetails.details.key] = cmdDetails.details.value;
+		else if (details.announcements){
+			state[combatState].config.announcements[details.key] = details.value;
 		}
-		else if (cmdDetails.details.status){
-			state[combatState].config.status[cmdDetails.details.key] = cmdDetails.details.value;
+		else if (details.status){
+			state[combatState].config.status[details.key] = details.value;
 		}
-		else if (cmdDetails.details.concentration){
-			state[combatState].config.concentration[cmdDetails.details.key] = cmdDetails.details.value;
+		else if (details.concentration){
+			state[combatState].config.concentration[details.key] = details.value;
 		}
 		else {
-    		if (cmdDetails.details.key === 'name' && cmdDetails.details.value.replace(/\s/g, '').toLowerCase() !== state[combatState].config.conditions[cmdDetails.details.condition]) {
-      			state[combatState].config.conditions[cmdDetails.details.value.toLowerCase()] = state[combatState].config.conditions[cmdDetails.details.condition];
-      			state[combatState].config.conditions[cmdDetails.details.value.toLowerCase()].key = cmdDetails.details.value.toLowerCase()
-      			state[combatState].config.conditions[cmdDetails.details.value.toLowerCase()].name = cmdDetails.details.value
-      			delete state[combatState].config.conditions[cmdDetails.details.condition];
-      			sendConditionMenu(cmdDetails.details.value.toLowerCase())
+		    let oldKey = details.condition
+		    if (!oldKey || !conditions[oldKey]) {
+		        makeAndSendMenu('That condition does not exist anymore.', 'Setup', 'gm')
+		        return
+		    }
+    		if (details.key === 'name') {
+    		    let newName = String(details.value)
+    		    let newKey  = newName.toLowerCase()
+    		    if (newKey !== oldKey) {
+    		        if (conditions[newKey]) {
+    		            makeAndSendMenu('A condition called <b>' + HE(newName) + '</b> already exists.', 'Setup', 'gm')
+    		            sendConditionMenu(oldKey)
+    		            return
+    		        }
+    		        conditions[newKey] = conditions[oldKey]
+    		        delete conditions[oldKey]
+    		    }
+    		    conditions[newKey].key  = newKey
+    		    conditions[newKey].name = newName
+    		    sendConditionMenu(newKey)
     	    } else {
-    	        if (cmdDetails.details.key == 'description') {
-    	            cmdDetails.details.value = cmdDetails.details.value
-    	        }
-		        state[combatState].config.conditions[cmdDetails.details.condition][cmdDetails.details.key] = cmdDetails.details.value;
+		        conditions[oldKey][details.key] = details.value;
     	    }
 		}
 	},
@@ -1121,17 +1364,22 @@ var CombatMaster = CombatMaster || (function() {
             log ('Delete Condition')
         }
 
-		if (confirm === 'yes') {
-			if(!key){
-				sendConditionsMenu('You didn\'t give a condition name, eg. <i>!cmaster --delete,condition=Prone</i>.');
-			} else if( !state[combatState].config.conditions[key]){
-				sendConditionsMenu('The condition `'+key+'` does\'t exist.');
-			} else {
-				delete state[combatState].config.conditions[key];
-				sendConditionsMenu('The condition `'+key+'` is removed.');
-			}
+		if (confirm !== 'yes') {
+		    if (key && state[combatState].config.conditions[key]) {
+		        sendConditionMenu(key)
+		    } else {
+		        sendConditionsMenu()
+		    }
+		    return
 		}
-		sendConditionsMenu('Condition was deleted')
+		if(!key){
+			sendConditionsMenu('You didn\'t give a condition name, eg. <i>!cmaster --delete,condition=Prone</i>.');
+		} else if( !state[combatState].config.conditions[key]){
+			sendConditionsMenu('The condition `'+key+'` doesn\'t exist.');
+		} else {
+			delete state[combatState].config.conditions[key];
+			sendConditionsMenu('The condition `'+key+'` is removed.');
+		}
 	},
 
     getConditionByMarker = function (marker) {
@@ -1139,10 +1387,19 @@ var CombatMaster = CombatMaster || (function() {
             log('Get Condition By Marker')
         }
 
-        let key
+        let markerName = String(marker || '').split('@')[0]
+        if (!markerName) {
+            return false
+        }
+
+        let key, condition
         for (key in state[combatState].config.conditions) {
-            if (marker.includes(state[combatState].config.conditions[key].icon)) {
-                return state[combatState].config.conditions[key]
+            condition = state[combatState].config.conditions[key]
+            if (!condition || !condition.icon) {
+                continue
+            }
+            if (markerName === condition.icon || (condition.iconType == 'Token Marker' && markerName.split('::')[0] === condition.icon)) {
+                return condition
             }
         }
         return false;
@@ -1181,10 +1438,7 @@ var CombatMaster = CombatMaster || (function() {
 			makeAndSendMenu('No tokens were selected.', '', 'gm');
 			return false;
         }
-        if (token == getOrCreateMarker().get('id')) {
-            return false;
-        }
-        if (token == getOrCreateMarker(true).get('id')) {
+        if (isTurnMarkerId(token)) {
             return false;
         }
         return true;
@@ -1271,7 +1525,13 @@ var CombatMaster = CombatMaster || (function() {
 
             if (newCondition.iconType == 'Token Condition') {
                 let characterObj = findObjs({name: newCondition.icon, _type: 'character'})[0];
-                characterObj.get("defaulttoken", function(defaulttoken) {
+                if (!characterObj) {
+                    makeAndSendMenu('Token Condition character <b>' + HE(String(newCondition.icon)) + '</b> was not found.', '', 'gm');
+                } else characterObj.get("defaulttoken", function(defaulttoken) {
+                    if (!defaulttoken) {
+                        makeAndSendMenu('Character <b>' + HE(characterObj.get('name')) + '</b> has no default token.', '', 'gm');
+                        return
+                    }
 
                     let newToken = JSON.parse(defaulttoken)
                     let condition = createObj('graphic', {
@@ -1286,6 +1546,10 @@ var CombatMaster = CombatMaster || (function() {
                                         width: tokenObj.get('width'),
                                         height: tokenObj.get('height')
                                     });
+                    if (!condition) {
+                        makeAndSendMenu('Could not create the Token Condition token. Its image must be in your Roll20 library.', '', 'gm');
+                        return
+                    }
                     let result = TokenCondition.AttachConditionToToken(condition.id,tokenObj.id);
         			if(result.success) {
         				newCondition.tokenConditionID = condition.id
@@ -1345,6 +1609,9 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     getCleanImgsrc =  function (imgsrc) {
+        if (!imgsrc || typeof imgsrc !== 'string') {
+            return;
+        }
         let parts = imgsrc.match(/(.*\/images\/.*)(thumb|med|original|max)([^?]*)(\?[^?]+)?$/);
         if(parts) {
             return parts[1]+'thumb'+parts[3]+(parts[4]?parts[4]:`?${Math.round(Math.random()*9999999)}`);
@@ -1371,6 +1638,9 @@ var CombatMaster = CombatMaster || (function() {
                     if (condition.target.length > 0) {
                         targets = condition.target
                         targets.forEach((target, j) => {
+                            if (!getObj('graphic', target)) {
+                                return
+                            }
                             if (condition.iconType == 'Token Condition') {
                                 removeTokenCondition(condition.tokenConditionID)
                             } else {
@@ -1390,7 +1660,9 @@ var CombatMaster = CombatMaster || (function() {
                 }
                 if (condition.concentration == true) {
                     let concentration = getConditionByKey('concentration')
-                    removeMarker(tokenObj, concentration.iconType, concentration.icon)
+                    if (concentration) {
+                        removeMarker(tokenObj, concentration.iconType, concentration.icon)
+                    }
                 }
 			    if (!condition.targeted || (condition.targeted && condition.targetedAPI == 'casterTargets')) {
 			        if (removeAPI) {
@@ -1398,7 +1670,10 @@ var CombatMaster = CombatMaster || (function() {
 			        }
 			    }
 
-                state[combatState].conditions.splice(i,1)
+                let index = state[combatState].conditions.indexOf(condition)
+                if (index > -1) {
+                    state[combatState].conditions.splice(index,1)
+                }
                 removed = true
             }
         });
@@ -1414,8 +1689,10 @@ var CombatMaster = CombatMaster || (function() {
         if (debug) {
             log('Remove Token Condition')
         }
-        let conditionToken = findObjs({_id:id,_pageid:Campaign().get("playerpageid"), _type: 'graphic'})[0];
-        conditionToken.remove()
+        let conditionToken = id ? getObj('graphic', id) : undefined;
+        if (conditionToken) {
+            conditionToken.remove()
+        }
     },
 
     sendConditionToChat = function (key) {
@@ -1446,6 +1723,9 @@ var CombatMaster = CombatMaster || (function() {
         [...state[combatState].conditions].forEach((condition,i) => {
             if (condition.id == id && condition.key == key) {
                 selectedTokens.forEach(token => {
+                    if (!getObj('graphic', token._id) || isTurnMarkerId(token._id)) {
+                        return
+                    }
                     state[combatState].conditions[i].target.push(token._id)
                     addMarker(getObj('graphic', token._id), condition.iconType, condition.icon, condition.duration, condition.direction, condition.key)
                     doAddConditionCalls(getObj('graphic', token._id), condition.key)
@@ -1459,78 +1739,82 @@ var CombatMaster = CombatMaster || (function() {
 //START/STOP COMBAT
 //*************************************************************************************************************
     verifySetup = function(selectedTokens, initiative) {
-        let initAttributes, turnorder, attribute, whisper, characterObj, verified=true, i, tokenObj
-
         if (debug) {
             log('Verify Setup')
         }
 
-        if ((!selectedTokens || selectedTokens.length == 0) && !state[combatState].config.hold.held) {
-            makeAndSendMenu('No tokens selected.  Combat not started',' ', whisper);
-            return false
+        if (state[combatState].config.hold.held) {
+            return true
         }
 
         if (initiative.rollInitiative == 'None') {
-            turnorder = getTurnorder()
-            if (turnorder.length == 0) {
-                makeAndSendMenu('Auto Roll Initiative has been set to None and your turn order is currently empty',' ', whisper);
-                verified=false
-                return
+            if (getTurnorder().length == 0) {
+                makeAndSendMenu('Roll Initiative is set to None and your turn order is empty. Combat not started.', '', 'gm');
+                return false
             }
+            return true
         }
 
-        if (initiative.rollInitiative == 'CombatMaster' && !state[combatState].config.hold.held) {
+        if (!selectedTokens || selectedTokens.length == 0) {
+            makeAndSendMenu('No tokens selected. Combat not started.', '', 'gm');
+            return false
+        }
+
+        if (initiative.rollInitiative == 'CombatMaster') {
             selectedTokens.forEach(token => {
                 if (token._type == 'graphic') {
-                    tokenObj        = getObj('graphic', token._id)
-                    if (tokenObj) {
-                        whisper         = (tokenObj.layer == 'gmlayer') ? 'gm ' : ''
-                        characterObj    = getObj('character', tokenObj.get('represents'))
-        				if (!characterObj) {
-                             makeAndSendMenu('A token was found not assigned to a character sheet',' ', whisper);
-                        }
+                    let tokenObj = getObj('graphic', token._id)
+                    if (tokenObj && !isTurnMarkerId(tokenObj.id) && !getObj('character', tokenObj.get('represents'))) {
+                        makeAndSendMenu('The token <b>' + HE(tokenObj.get('name') || '(no name)') + '</b> is not linked to a character sheet and was skipped.', '', 'gm');
                     }
                 }
 			})
         }
 
-        return verified
+        return true
     },
 
-    startCombat = function (selectedTokens, who) {
+    startCombat = async function (selectedTokens, who) {
         if (debug) {
             log('Start Combat')
         }
 
         let initiative  = state[combatState].config.initiative
-        let turnorder   = state[combatState].config.turnorder
-        let verified    = verifySetup(selectedTokens, initiative)
         let hold        = state[combatState].config.hold
+        let wasHeld     = hold.held
+        let verified    = verifySetup(selectedTokens, initiative)
 
-        if (!verified && !hold.held) {
+        if (!verified) {
             return
         }
 
         Campaign().set('initiativepage', Campaign().get('playerpageid'));
         paused = false;
 
-        if (hold.held) {
+        if (wasHeld) {
             restartCombat(hold, who)
-        } else {
-            if(initiative.rollInitiative == 'CombatMaster'){
-                rollInitiative(selectedTokens, initiative);
-            } else if (initiative.rollInitiative == 'Group-Init') {
-                rollGroupInit(selectedTokens)
-            } else if (!getTurnorder()) {
-                makeAndSendMenu('You must have a populated turnorder before starting Combat Master','');
+        } else if (initiative.rollInitiative == 'CombatMaster') {
+            await rollInitiative(selectedTokens, initiative);
+        } else if (initiative.rollInitiative == 'Group-Init') {
+            if (!rollGroupInit(selectedTokens)) {
                 return
             }
+            let ready = await waitForTurnorder(15000)
+            if (!ready) {
+                makeAndSendMenu('GroupInitiative did not fill the turn order. Combat not started.', '', 'gm');
+                return
+            }
+        }
+
+        if (!wasHeld && getTurnorder().length == 0) {
+            makeAndSendMenu('The turn order is empty. Combat not started.', '', 'gm');
+            return
         }
 
         setTimeout(function() {
             doRoundCalls()
             doTurnorderChange()
-        },2000)
+        }, wasHeld ? 2000 : 250)
     },
 
     restartCombat = function (hold,who) {
@@ -1557,7 +1841,7 @@ var CombatMaster = CombatMaster || (function() {
 
         if (state[combatState].config.status.clearConditions) {
             [...state[combatState].conditions].forEach((condition) => {
-                if (condition.id != getOrCreateMarker(true).get('id') && condition.id != getOrCreateMarker(false).get('id')) {
+                if (!isTurnMarkerId(condition.id)) {
                     removeConditionFromToken(getObj('graphic',condition.id), condition.key, true)
                 }
             })
@@ -1607,64 +1891,84 @@ var CombatMaster = CombatMaster || (function() {
         hold.conditions = []
     },
 
-    rollInitiative = function (selectedTokens, initiative) {
-        let tokenObj, whisper, initiativeTemp, initiativeRoll, characterObj, initAttributes, initiativeMod, i, advantageAttrib, initiativeAdv1, initiativeAdv2
+    rollInitiative = async function (selectedTokens, initiative) {
+        let turns          = []
+        let dieSize        = parseInt(initiative.initiativeDie) || 0
+        let rollDie        = () => (dieSize > 0) ? randomInteger(dieSize) : 0
+        let initAttributes = String(initiative.initiativeAttributes || '').split(',').map(a => a.trim()).filter(a => a && a !== 'None')
+        let token, tokenObj, characterObj, attribute
 
-        //loop through selected tokens
-        selectedTokens.forEach(token => {
-            if (token._type == 'graphic') {
-                tokenObj        = getObj('graphic', token._id)
-                if (tokenObj) {
-                    characterObj    = getObj('character', tokenObj.get('represents'))
+        for (token of (selectedTokens || [])) {
+            if (!token || token._type != 'graphic' || isTurnMarkerId(token._id)) {
+                continue
+            }
+            tokenObj = getObj('graphic', token._id)
+            if (!tokenObj) {
+                continue
+            }
+            characterObj = getObj('character', tokenObj.get('represents'))
+            if (!characterObj) {
+                continue
+            }
 
-                    if (characterObj) {
-                        whisper         = (tokenObj.get('layer') === 'gmlayer') ? 'gm ' : ''
-                        initiativeRoll  = (initiative.initiativeDie) ? randomInteger(initiative.initiativeDie) : 0;
-                        initAttributes  = initiative.initiativeAttributes.split(',')
-                        initiativeMod   = 0
+            let whisper       = (tokenObj.get('layer') === 'gmlayer') ? 'gm' : ''
+            let initiativeMod = 0
+            let missing       = []
 
-                        initAttributes.forEach((attributes) => {
-                            initiativeTemp  = getAttrByName(characterObj.id,attributes,'current')
-                            initiativeMod  += parseFloat(initiativeTemp)
-                        })
-
-                        //check for advantage initiative rolling (OGL)
-                        advantageAttrib   = getAttrByName(characterObj.id, 'initiative_style', 'current');
-                        if (typeof advantageAttrib != 'undefined') {
-                            // roll advantage for initiative
-                            initiativeAdv1 = (initiative.initiativeDie) ? randomInteger(initiative.initiativeDie) : 0;
-                            initiativeAdv2 = (initiative.initiativeDie) ? randomInteger(initiative.initiativeDie) : 0;
-                            // this is the value if in OGL if rolling advantage
-                            if (advantageAttrib == '{@{d20},@{d20}}kh1') {
-                                //determine which value is higher
-                                if (initiativeAdv1 >= initiativeAdv2) {
-                                    initiativeRoll = initiativeAdv1
-                                } else {
-                                    initiativeRoll = initiativeAdv2
-                                }
-                                //pass in both values and modifier for display
-                                if (initiative.showInitiative) {
-                                    sendInitiativeChat(tokenObj.get('name'),initiativeAdv1,initiativeMod,initiativeAdv2,whisper)
-                                }
-                            } else if (initiative.showInitiative) {
-                                // if not rolling advantage, use first roll
-                                initiativeRoll = initiativeAdv1
-                                sendInitiativeChat(tokenObj.get('name'),initiativeRoll,initiativeMod,null,whisper)
-                            }
-                        }  else if (initiative.showInitiative) {
-                            // if everything else then pass in for display
-                             sendInitiativeChat(tokenObj.get('name'),initiativeRoll,initiativeMod,null,whisper)
-                        }
-                        //add to turnorder
-                        if (Number.isInteger(initiativeMod+initiativeRoll)) {
-                            addToTurnorder({id:tokenObj.id,pr:(initiativeMod+initiativeRoll),custom:'',_pageid:tokenObj.get("pageid")});
-                        } else {
-                            addToTurnorder({id:tokenObj.id,pr:(initiativeMod+initiativeRoll).toFixed(2),custom:'',_pageid:tokenObj.get("pageid")});
-                        }
-                    }
+            // getSheetItem is async, so every value is awaited one after the other
+            for (attribute of initAttributes) {
+                let value = await getSheetNumber(characterObj.id, attribute)
+                if (typeof value === 'undefined') {
+                    missing.push(attribute)
+                } else {
+                    initiativeMod += value
                 }
             }
-        });
+            if (missing.length) {
+                warnMissingAttributes(characterObj, missing)
+            }
+
+            let initiativeRoll = rollDie()
+            let secondRoll     = null
+
+            // D&D 2014 sheet: advantage on initiative is stored in initiative_style
+            if (!isBeaconCharacter(characterObj) && typeof getAttrByName === 'function') {
+                let advantageAttrib
+                try {
+                    advantageAttrib = getAttrByName(characterObj.id, 'initiative_style', 'current')
+                } catch (err) {
+                    advantageAttrib = undefined
+                }
+                if (advantageAttrib == '{@{d20},@{d20}}kh1') {
+                    secondRoll = rollDie()
+                }
+            }
+
+            let total
+            if (secondRoll !== null) {
+                total = Math.max(initiativeRoll, secondRoll) + initiativeMod
+                if (initiative.showInitiative) {
+                    sendInitiativeChat(tokenObj.get('name'),initiativeRoll,initiativeMod,secondRoll,whisper)
+                }
+            } else {
+                total = initiativeRoll + initiativeMod
+                if (initiative.showInitiative) {
+                    sendInitiativeChat(tokenObj.get('name'),initiativeRoll,initiativeMod,null,whisper)
+                }
+            }
+
+            turns.push({
+                id: tokenObj.id,
+                pr: Number.isInteger(total) ? total : total.toFixed(2),
+                custom: '',
+                _pageid: tokenObj.get('pageid')
+            })
+        }
+
+        if (turns.length) {
+            let turnorder = getTurnorder().filter(t => !turns.some(n => n.id === t.id))
+            setTurnorder(turnorder.concat(turns))
+        }
 
         if(state[combatState].config.turnorder.sortTurnOrder){
             sortTurnorder();
@@ -1672,14 +1976,14 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     rollGroupInit = function (selectedTokens) {
-        let giRoll = () => sendChat('',`/w gm <code>GroupInitiative.RollForTokenIDs()</code> is not supported.`);
-
-
     	if('undefined' !== typeof GroupInitiative && GroupInitiative.RollForTokenIDs){
 			GroupInitiative.RollForTokenIDs(
-				(selectedTokens||[]).map(s=>s._id),{manualBonus: 0}
+				(selectedTokens||[]).map(s=>s._id).filter(id => !isTurnMarkerId(id)),{manualBonus: 0}
 			);
+			return true
     	}
+    	makeAndSendMenu('Roll Initiative is set to Group-Init, but the GroupInitiative script is not installed.', '', 'gm');
+    	return false
     },
 
     sendInitiativeChat = function (name,rollInit,bonus,rollInit1,whisper) {
@@ -1728,10 +2032,8 @@ var CombatMaster = CombatMaster || (function() {
             log(marker)
         }
 
-        let installed = verifyInstalls(markerType)
-        if (!installed) {
-             makeAndSendMenu('You are missing an API required by an Icon Type you are using.  Install libTokenMarker or TokenConditions.');
-             return
+        if (!tokenObj || !verifyInstalls(markerType)) {
+            return
         }
 
         let icon = getIconTag(markerType, marker)
@@ -1743,16 +2045,18 @@ var CombatMaster = CombatMaster || (function() {
 
         setTimeout(() => {
             let statusMarkers = returnMarkers(tokenObj)
+            let dur = parseInt(duration)
+            let dir = parseInt(direction)
 
             let statusMarker
-            if (key == 'dead' || duration <= 0 || duration >= 10 || (duration == 1 && direction == 0)) {
+            if (key == 'dead' || isNaN(dur) || dur <= 0 || dur >= 10 || (dur == 1 && dir == 0)) {
                 statusMarker = icon
             } else {
-                statusMarker = icon+'@'+duration
+                statusMarker = icon+'@'+dur
             }
 
             statusMarkers.push(statusMarker)
-            tokenObj.set('statusmarkers', statusMarkers.join())
+            tokenObj.set('statusmarkers', statusMarkers.join(','))
         }, 500);
     },
 
@@ -1762,10 +2066,8 @@ var CombatMaster = CombatMaster || (function() {
             log(marker)
         }
 
-        let installed = verifyInstalls(markerType)
-        if (!installed) {
-             makeAndSendMenu('You are missing an API required by an Icon Type you are using.  Install libTokenMarker or TokenConditions.');
-             return
+        if (!tokenObj || !verifyInstalls(markerType)) {
+            return
         }
 
         let iconTag = getIconTag(markerType, marker)
@@ -1773,32 +2075,64 @@ var CombatMaster = CombatMaster || (function() {
             return
         }
 
-        let statusMarkers = returnMarkers(tokenObj)
-
-        statusMarkers.forEach((a, i) => {
-            if (a.indexOf(iconTag) > -1) {
-                statusMarkers.splice(i,1)
-            }
-        });
-        tokenObj.set('statusmarkers', statusMarkers.join())
+        let statusMarkers = returnMarkers(tokenObj).filter(m => m.split('@')[0] !== iconTag)
+        tokenObj.set('statusmarkers', statusMarkers.join(','))
     },
 
     returnMarkers = function(tokenObj) {
-        return tokenObj.get('statusmarkers').split(',')
+        if (!tokenObj) {
+            return []
+        }
+        return String(tokenObj.get('statusmarkers') || '').split(',').filter(m => m !== '')
+    },
+
+    getMarkerIds = function () {
+        if (!state[combatState].markerIds) {
+            state[combatState].markerIds = {current: null, next: null}
+        }
+        return state[combatState].markerIds
+    },
+
+    isTurnMarkerId = function (id) {
+        let ids = getMarkerIds()
+        return !!id && (id === ids.current || id === ids.next)
+    },
+
+    getMarkerImgsrc = function (next=false) {
+        let turnorder = state[combatState].config.turnorder
+        let type      = (next) ? turnorder.nextMarkerType : turnorder.markerType
+        let imgsrc
+
+        if (type == 'Token Marker' && 'undefined' !== typeof libTokenMarkers) {
+            let name   = (next) ? turnorder.nextTokenMarkerName : turnorder.tokenMarkerName
+            let status = (name && name !== 'None') ? libTokenMarkers.getStatus(name) : null
+            imgsrc     = status && status.url
+        }
+        if (!imgsrc) {
+            imgsrc = (next) ? turnorder.nextExternalMarkerURL : turnorder.externalMarkerURL
+        }
+
+        return getCleanImgsrc(imgsrc) || getCleanImgsrc((next) ? defaultMarkerURLs.next : defaultMarkerURLs.current)
+    },
+
+    findTurnMarker = function (next=false) {
+        let ids = getMarkerIds()
+        let id  = (next) ? ids.next : ids.current
+        return (id) ? getObj('graphic', id) : undefined
     },
 
     resetMarker = function (next=false) {
-        let marker = getOrCreateMarker(next),
-            turnorder = state[combatState].config.turnorder;
+        let marker = getOrCreateMarker(next)
 
         if (debug) {
             log('Reset Marker')
         }
+        if (marker.isNull) {
+            return marker
+        }
 
         marker.set({
             name: (next) ? 'NextMarker' : 'Round ' + round,
-            imgsrc: (next) ? getCleanImgsrc(turnorder.nextExternalMarkerURL) : getCleanImgsrc(turnorder.externalMarkerURL),
-            pageid: Campaign().get('playerpageid'),
             layer: 'gmlayer',
             left: 35, top: 35,
             width: 70, height: 70
@@ -1808,31 +2142,34 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     getOrCreateMarker = function (next=false) {
-        let pageid    = Campaign().get('playerpageid')
-		let	turnorder = state[combatState].config.turnorder
+        let pageid = Campaign().get('playerpageid')
+        let ids    = getMarkerIds()
+        let marker = findTurnMarker(next)
 
         if (debug) {
             log('Get or Create Marker')
         }
 
-		let imgsrc
-		if (turnorder.markerType == 'External URL') {
-            imgsrc = (next) ? turnorder.nextExternalMarkerURL : turnorder.externalMarkerURL
-		} else {
-			imgsrc = (next) ? turnorder.nextTokenMarkerURL : turnorder.tokenMarkerURL
-		}
+        if (marker && marker.get('pageid') !== pageid) {
+            marker.remove()
+            marker = undefined
+        }
 
- 		let markers = (next) ? findObjs({pageid,imgsrc:getCleanImgsrc(imgsrc),name: 'NextMarker'}) : findObjs({pageid,imgsrc:getCleanImgsrc(imgsrc)});
+        if (!marker) {
+            // re-use markers left on the page by older versions of CombatMaster
+            let legacy = findObjs({_type: 'graphic', _pageid: pageid}).filter(g => {
+                let name = g.get('name') || ''
+                return (next) ? name === 'NextMarker' : /^Round -?\d+$/.test(name)
+            })
+            marker = legacy.shift()
+            legacy.forEach(extra => extra.remove())
+        }
 
-        markers.forEach((marker, i) => {
-            if(i > 0 && !next) marker.remove();
-        });
-
-        let marker = markers.shift();
-        if(!marker) {
+        if (!marker) {
             marker = createObj('graphic', {
-                name: (next) ? 'NextMarker' : 'Round 1',
-                imgsrc: getCleanImgsrc(imgsrc),
+                subtype: 'token',
+                name: (next) ? 'NextMarker' : 'Round ' + round,
+                imgsrc: getMarkerImgsrc(next),
                 pageid: pageid,
                 layer: 'gmlayer',
                 showplayers_name: true,
@@ -1841,7 +2178,20 @@ var CombatMaster = CombatMaster || (function() {
             });
         }
 
-        if(!next) checkMarkerturn(marker);
+        if (!marker) {
+            if (!markerWarned) {
+                markerWarned = true
+                makeAndSendMenu('Could not create the turn marker. The marker image must be uploaded to a Roll20 library. Check the marker URL in Setup > Turnorder.', 'Turn Marker', 'gm')
+            }
+            return nullMarker
+        }
+
+        if (next) {
+            ids.next = marker.id
+        } else {
+            ids.current = marker.id
+            checkMarkerturn(marker)
+        }
 
         toBack(marker);
 
@@ -1849,31 +2199,39 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     checkMarkerturn = function (marker) {
-        let turnorder = getTurnorder(),
-            hasTurn = false;
+        if (!marker || marker.isNull) {
+            return
+        }
+
+        let turnorder = getTurnorder()
 
         if (debug) {
             log ('Check Marker Turn')
         }
 
-        turnorder.forEach(turn => {
-            if(turn.id === marker.get('id')) hasTurn = true;
-        });
-
-        if(!hasTurn){
+        if(!turnorder.some(turn => turn.id === marker.get('id'))){
             turnorder.push({ id: marker.get('id'), pr: -1, custom: '', _pageid: marker.get('pageid') });
-            Campaign().set('turnorder', JSON.stringify(turnorder));
+            setTurnorder(turnorder);
         }
     },
 
     removeMarkers = function () {
         stopMarkerAnimation();
-        getOrCreateMarker().remove();
-        getOrCreateMarker(true).remove();
+        [findTurnMarker(false), findTurnMarker(true)].forEach(marker => {
+            if (marker) {
+                marker.remove()
+            }
+        })
+        let ids = getMarkerIds()
+        ids.current = null
+        ids.next = null
     },
 
    changeMarker = function (token, next=false)  {
         let marker = getOrCreateMarker(next);
+        if (marker.isNull) {
+            return
+        }
 
         if (debug) {
             log('Change Marker')
@@ -2007,7 +2365,11 @@ var CombatMaster = CombatMaster || (function() {
         }
         let turn        = getCurrentTurn()
         let marker      = getOrCreateMarker()
-        let tokenObj    = findObjs({_id:turn.id, _pageid:Campaign().get("playerpageid"), _type: 'graphic'})[0];
+        let tokenObj    = (turn && turn.id && turn.id !== '-1') ? getObj('graphic', turn.id) : undefined;
+
+        if (!turn) {
+            return
+        }
 
         if (turn.id === '-1') {
             doRoundCalls()
@@ -2067,21 +2429,33 @@ var CombatMaster = CombatMaster || (function() {
             log("Handle Turnorder Change")
         }
 
-        if(obj.get('turnorder') === prev.turnorder) return;
+        if (!obj || !prev || typeof prev.turnorder === 'undefined') return;
+        if (obj.get('turnorder') === prev.turnorder) return;
 
-        let turnorder = (obj.get('turnorder') === "") ? [] : JSON.parse(obj.get('turnorder'));
-        let prevTurnorder = (prev.turnorder === "") ? [] : JSON.parse(prev.turnorder);
+        let turnorder, prevTurnorder
+        try {
+            turnorder     = (!obj.get('turnorder')) ? [] : JSON.parse(obj.get('turnorder'));
+            prevTurnorder = (!prev.turnorder) ? [] : JSON.parse(prev.turnorder);
+        } catch (err) {
+            return
+        }
 
-        log(turnorder)
-        log(prevTurnorder)
-        log(obj.get('turnorder'))
-        if(obj.get('turnorder') == []){
+        // Only react when CombatMaster is running combat
+        if (!getMarkerIds().current) {
+            return
+        }
+
+        if (turnorder.length === 0) {
             stopCombat();
             return;
         }
 
-        if(turnorder.length && prevTurnorder.length && turnorder[0].id !== prevTurnorder[0].id){
-            if (turnorder[0].pr == -1 && prevTurnorder[1].pr != -1) {
+        if (!turnorder.some(t => isTurnMarkerId(t.id))) {
+            return
+        }
+
+        if(prevTurnorder.length && turnorder[0].id !== prevTurnorder[0].id){
+            if (turnorder[0].pr == -1 && prevTurnorder[1] && prevTurnorder[1].pr != -1) {
                 doTurnorderChange(true);
             } else {
                 doTurnorderChange();
@@ -2128,7 +2502,12 @@ var CombatMaster = CombatMaster || (function() {
         turnorder   = getTurnorder()
         currentTurn = turnorder.shift();
 
-        if (getVeryNextTurn().id === getOrCreateMarker().get('id')) {
+        let veryNextTurn = getVeryNextTurn()
+        if (!currentTurn || !veryNextTurn) {
+            return
+        }
+
+        if (isTurnMarkerId(veryNextTurn.id)) {
             setTurnorder(turnorder)
             nextRound()
             turnorder   = getTurnorder()
@@ -2197,9 +2576,12 @@ var CombatMaster = CombatMaster || (function() {
         if(initiative.rollEachRound){
             let turnorder = getTurnorder();
             clearTurnorder();
-            checkMarkerturn(marker)
-            rollInitiative(turnorder.map(t => { return (t.id) ? { _type: 'graphic', _id: t.id } : false }), initiative);
-            doTurnorderChange()
+            rollInitiative(turnorder.map(t => { return (t.id) ? { _type: 'graphic', _id: t.id } : false }), initiative)
+                .then(() => {
+                    checkMarkerturn(marker)
+                    doTurnorderChange()
+                })
+                .catch(err => reportError('Next Round', err));
         }else{
             nextTurn();
             if(state[combatState].config.turnorder.sortTurnOrder){
@@ -2215,7 +2597,7 @@ var CombatMaster = CombatMaster || (function() {
     getNextTurn = function () {
         let returnturn;
         getTurnorder().every((turn, i) => {
-            if(i > 0 && turn.id !== '-1' && turn.id !== getOrCreateMarker().get('id')){
+            if(i > 0 && turn.id !== '-1' && !isTurnMarkerId(turn.id)){
                 returnturn = turn;
                 return false;
             }else return true
@@ -2379,12 +2761,13 @@ var CombatMaster = CombatMaster || (function() {
         let descriptionButton
         let removed = false
         let output = '<div>'
-        let target
 
         if (state[combatState].conditions) {
             [... state[combatState].conditions].forEach(condition => {
-                if (condition.id == tokenObj.get("_id") || condition.target.includes(tokenObj.get("_id"))) {
-                    if (condition.target.includes(tokenObj.get("_id"))){
+                let targets = Array.isArray(condition.target) ? condition.target : []
+                let target  = false
+                if (condition.id == tokenObj.get("_id") || targets.includes(tokenObj.get("_id"))) {
+                    if (condition.id != tokenObj.get("_id") && targets.includes(tokenObj.get("_id"))){
                         target = true
                     }
 
@@ -2421,7 +2804,7 @@ var CombatMaster = CombatMaster || (function() {
                         output += '<div style="display:inline-block;"><strong>'+descriptionButton+'</strong> '+condition.duration+' Permanent</div>';
                         if (condition.hasOwnProperty('message')) {
                             if (condition.message != 'None' && condition.message.length > 0) {
-                                output += '<div style="display:inline-block;"<strong>Message: </strong> '+condition.message+ '</div>';
+                                output += '<div style="display:inline-block;"><strong>Message: </strong> '+condition.message+ '</div>';
                             }
                         }
                     }
@@ -2442,7 +2825,11 @@ var CombatMaster = CombatMaster || (function() {
 //MAKES
 //*************************************************************************************************************
     makeAndSendMenu = function (contents, title, whisper) {
-        whisper = (whisper && whisper !== '') ? '/w ' + whisper + ' ' : '';
+        whisper = (whisper) ? String(whisper).trim() : ''
+        if (whisper && whisper !== 'gm' && /\s/.test(whisper) && !/^".*"$/.test(whisper)) {
+            whisper = '"' + whisper.replace(/"/g, '') + '"'
+        }
+        whisper = (whisper) ? '/w ' + whisper + ' ' : '';
 		title = makeTitle(title)
         sendChat(script_name, whisper + '<div style="'+styles.menu+styles.overflow+'">'+title+contents+'</div>', null, {noarchive:true});
     },
@@ -2604,18 +2991,22 @@ var CombatMaster = CombatMaster || (function() {
         let tokenObj, characterObj, macro
 
         turnorder.forEach((turn) => {
-            if (turn.id !== getOrCreateMarker().get('id')) {
+            if (!isTurnMarkerId(turn.id)) {
                 tokenObj     = getObj('graphic',turn.id)
                 if (tokenObj) {
                     characterObj = getObj('character',tokenObj.get('represents'))
                     if (characterObj) {
                         if (!['None',''].includes(config.allRoundMacro)) {
                             macro = getMacro(tokenObj, config.allRoundMacro)
-                            sendCalltoChat(tokenObj,characterObj,macro.get('action'))
+                            if (macro) {
+                                sendCalltoChat(tokenObj,characterObj,macro.get('action'))
+                            }
                         }
                         if ( !['None',''].includes(config.characterRoundMacro) && characterObj.get('controlledby') != '') {
                             macro = getMacro(tokenObj, config.characterRoundMacro)
-                            sendCalltoChat(tokenObj,characterObj,macro.get('action'))
+                            if (macro) {
+                                sendCalltoChat(tokenObj,characterObj,macro.get('action'))
+                            }
                         }
                         if (!['None',''].includes(config.roundAPI)) {
                             sendCalltoChat(tokenObj,characterObj,config.roundAPI)
@@ -2673,7 +3064,7 @@ var CombatMaster = CombatMaster || (function() {
                     sendCalltoChat(tokenObj,characterObj,config.turnAPI)
                 }
                 if (!['None',''].includes(config.turnRoll20AM)) {
-                    sendCalltoChat(tokenObj,characterObj,config.roundRoll20AM)
+                    sendCalltoChat(tokenObj,characterObj,config.turnRoll20AM)
                 }
                 if (!['None',''].includes(config.turnFX)) {
                     doFX(tokenObj,config.turnFX)
@@ -2770,11 +3161,14 @@ var CombatMaster = CombatMaster || (function() {
             })
         }
 
+        if (!action) {
+            return
+        }
         sendChat(tokenObj.get('name'), action, null, {noarchive:true});
     },
 
     doFX = function (tokenObj, fx) {
-        if(tokenObj.get('layer') === 'gmlayer') return;
+        if(!tokenObj || tokenObj.get('layer') === 'gmlayer') return;
 
         let pos = {x: tokenObj.get('left'), y: tokenObj.get('top')};
         spawnFxBetweenPoints(pos, pos, fx, tokenObj.get('pageid'));
@@ -2782,8 +3176,8 @@ var CombatMaster = CombatMaster || (function() {
 
     getMacro = function(tokenObj, name) {
         let macro = findObjs({_characterid:tokenObj.get('represents'), _type:'ability', name:name})[0]
-        if (!action) {
-            macro = findObjs({_type:'macro', name:config.turnMacro})[0]
+        if (!macro) {
+            macro = findObjs({_type:'macro', name:name})[0]
         }
         return macro
     },
@@ -2821,7 +3215,82 @@ var CombatMaster = CombatMaster || (function() {
 //*************************************************************************************************************
 //SPELLS
 //*************************************************************************************************************
-    handleSpellCast = function(msg) {
+    // Reads a D&D 2024 (Beacon) spell card from an "advancedroll" chat message.
+    // Roll20 may change this markup, so the matching is kept loose on purpose.
+    parseBeaconSpell = function (msg) {
+        let content  = String(msg.content || '')
+        let title    = firstMatch(content, [/header__title[^>]*>\s*([^<]+?)\s*</i, /data-title\s*=\s*["']([^"']+)["']/i])
+        let subtitle = firstMatch(content, [/header__subtitle[^>]*>\s*([^<]+?)\s*</i]) || ''
+
+        if (!title) {
+            return null
+        }
+
+        // Spell cards have a subtitle like "Level 3 Evocation" or "Evocation Cantrip"
+        let levelMatch = subtitle.match(/level\s*(\d+)/i)
+        let isCantrip  = /cantrip/i.test(subtitle)
+        if (!levelMatch && !isCantrip) {
+            return null
+        }
+
+        let text = stripHTML(content)
+
+        let concentrate = /data-chip\s*=\s*["']?concentration["']?/i.test(content) ||
+                          /data-[a-z-]*\s*=\s*["']?concentration["']?/i.test(content) ||
+                          /concentration[,:]?\s+up\s+to/i.test(text) ||
+                          /duration\W{0,10}concentration/i.test(text)
+
+        let durationMatch = text.match(/duration[^0-9\n]{0,40}?(\d+)\s*(round|minute|hour)/i) ||
+                            text.match(/up\s+to\s+(\d+)\s*(round|minute|hour)/i)
+        let duration     = 1
+        let durationmult = 0
+        if (durationMatch) {
+            let unit = durationMatch[2].toLowerCase()
+            durationmult = (unit === 'round') ? 1 : (unit === 'minute') ? 10 : 600
+            duration     = parseInt(durationMatch[1]) * durationmult
+        }
+
+        let description = firstMatch(content, [/description[^"'>]*["'][^>]*>([\s\S]*?)<\/div>/i])
+
+        return {
+            spellName: stripHTML(title),
+            spellLevel: (levelMatch) ? levelMatch[1] : '0',
+            description: (description) ? stripHTML(description) : undefined,
+            concentrate: concentrate,
+            duration: duration,
+            durationmult: durationmult,
+            characterId: firstMatch(content, [/data-character-id\s*=\s*["']([^"']+)["']/i, /data-characterid\s*=\s*["']([^"']+)["']/i]),
+            characterName: firstMatch(content, [/meta__character[^>]*>\s*([^<]+?)\s*</i, /data-character-name\s*=\s*["']([^"']+)["']/i]) || msg.who
+        }
+    },
+
+    findCasterToken = function (characterId, characterName, playerid) {
+        let characterObj = (characterId) ? getObj('character', characterId) : undefined
+        if (!characterObj && characterName) {
+            characterObj = findObjs({_type: 'character', name: characterName})[0]
+        }
+        if (!characterObj) {
+            return undefined
+        }
+
+        let pages  = []
+        let player = getObj('player', playerid)
+        if (player && player.get('lastpage')) {
+            pages.push(player.get('lastpage'))
+        }
+        pages.push(Campaign().get('playerpageid'))
+
+        let pageid, token
+        for (pageid of pages) {
+            token = findObjs({_type: 'graphic', _pageid: pageid, represents: characterObj.id})[0]
+            if (token) {
+                return token
+            }
+        }
+        return undefined
+    },
+
+    handleSpellCast = function(msg, sheet) {
         if (debug) {
             log('Handle Spell Cast')
             log(msg)
@@ -2836,15 +3305,17 @@ var CombatMaster = CombatMaster || (function() {
         let duration        = 1
         let durationmult
         let direction       = 0
+        let characterId
+        let characterName
 
-        if (status.sheet == 'OGL') {
-            spellName    = msg.content.match(/name=([^\n{}]*[^"\n{}])/);
-            spellName    = RegExp.$1;
-            description  = msg.content.match(/description=([^\n{}]*[^"\n{}])/)
-            description  = RegExp.$1;
-            spellLevel   = msg.content.match(/spelllevel=([^\n{}]*[^"\n{}])/)
-            spellLevel   = RegExp.$1;
-            durationmult = 1
+        sheet = sheet || status.sheet
+
+        if (sheet == 'OGL') {
+            spellName     = firstMatch(msg.content, [/{{name=([^\n{}]*[^"\n{}])/, /name=([^\n{}]*[^"\n{}])/])
+            description   = firstMatch(msg.content, [/description=([^\n{}]*[^"\n{}])/])
+            spellLevel    = firstMatch(msg.content, [/spelllevel=([^\n{}]*[^"\n{}])/])
+            characterName = firstMatch(msg.content, [/charname=([^\n{}]*[^"\n{}])/])
+            durationmult  = 1
             if (msg.content.includes("{{concentration=1}}")) {
                 concentrate = true
             }
@@ -2852,15 +3323,13 @@ var CombatMaster = CombatMaster || (function() {
             if (!spellLevel && !concentrate) {
                 return;
             }
-        } else if (status.sheet == 'Shaped') {
-            spellName    = msg.content.match(/title=([^\n{}]*[^"\n{}])/);
-            spellName    = RegExp.$1;
-            description  = msg.content.match(/{{content=([^\n{}]*[^"\n{}])/);
-            description  = RegExp.$1;
-            duration     = msg.content.match(/duration=[^}\d]*([0-9]+)_([A-Z]+[^"\n{}_ ])/);
-            duration     = RegExp.$1;
-            durationmult = msg.content.match(/duration=[^}\d]*([0-9]+)_([A-Z]+[^"\n{}_ ])/);
-            durationmult = RegExp.$2;
+        } else if (sheet == 'Shaped') {
+            spellName     = firstMatch(msg.content, [/title=([^\n{}]*[^"\n{}])/])
+            description   = firstMatch(msg.content, [/{{content=([^\n{}]*[^"\n{}])/])
+            characterName = firstMatch(msg.content, [/{{character_name=([\w\d ]+[^"\n{}]?)/])
+            let durationParts = msg.content.match(/duration=[^}\d]*([0-9]+)_([A-Z]+[^"\n{}_ ])/)
+            duration      = (durationParts) ? parseInt(durationParts[1]) : 1
+            durationmult  = (durationParts) ? durationParts[2] : ''
             if (durationmult.includes("ROUND")) {
                 durationmult = 1
             } else if (durationmult.includes("MINUTE")) {
@@ -2876,23 +3345,44 @@ var CombatMaster = CombatMaster || (function() {
             if (msg.content.includes("CONCENTRATION")) {
                 concentrate = true
             }
-        } else if (status.sheet == 'PF2') {
-            spellName    = msg.content.match(/header=([^\n{}]*[^"\n{}])/);
-            spellName    = RegExp.$1;
-            description  = msg.content.match(/desc=([^\n{}]*[^"\n{}])/)
-            description  = RegExp.$1;
+        } else if (sheet == 'PF2') {
+            spellName    = firstMatch(msg.content, [/header=([^\n{}]*[^"\n{}])/])
+            description  = firstMatch(msg.content, [/desc=([^\n{}]*[^"\n{}])/])
+        } else if (sheet == 'DnD2024') {
+            let beacon = parseBeaconSpell(msg)
+            if (!beacon) {
+                return
+            }
+            spellName     = beacon.spellName
+            description   = beacon.description
+            spellLevel    = beacon.spellLevel
+            concentrate   = beacon.concentrate
+            duration      = beacon.duration
+            durationmult  = beacon.durationmult
+            characterId   = beacon.characterId
+            characterName = beacon.characterName
         }
 
         if (!spellName) {
             return
         }
 
+        // A single cast can post more than one chat card (attack, damage ...)
+        let castKey = spellName.toLowerCase() + '|' + (characterId || characterName || '')
+        let now = Date.now()
+        if (recentSpellCasts[castKey] && now - recentSpellCasts[castKey] < 4000) {
+            return
+        }
+        recentSpellCasts[castKey] = now
+
         if (debug) {
+            log('Sheet:'+sheet)
             log('Spell Name:'+spellName)
             log('Description:'+description)
             log('Concentrate:'+concentrate)
             log('Duration:'+duration)
             log('Duration Multiplier:'+durationmult)
+            log('Caster:'+(characterId || characterName))
         }
         if (!description) {
             description = 'None'
@@ -2901,18 +3391,11 @@ var CombatMaster = CombatMaster || (function() {
             duration = 1
         }
 
-        if (!direction) {
-            direction = 0
-        }
         if (status.autoAddSpells) {
             let key = spellName.toLowerCase()
             let condition = getConditionByKey(key)
-            if (duration >= 1) {
-                direction = -1
-            }
-            else {
-                direction = 0
-            }
+            direction = (duration >= 1) ? -1 : 0
+
             if (typeof condition == 'undefined' && !getIgnoresByKey(key)) {
                 state[combatState].spells[key] = {
                 				name: spellName,
@@ -2925,10 +3408,10 @@ var CombatMaster = CombatMaster || (function() {
                 				direction: direction,
                 				message: 'None',
                 				targeted: false,
+                				targetedAPI: 'casterTargets',
                 				favorite: false,
                 				override: false,
                 				concentration: concentrate,
-                				description: description,
                 				addAPI: 'None',
                 				addRoll20AM: 'None',
                 				addFX: 'None',
@@ -2942,23 +3425,17 @@ var CombatMaster = CombatMaster || (function() {
 
                 let addSpellButton = makeBigButton(`Add Spell to Combat Master`, `!cmaster --spell,confirm=true,key=${key}`)
                 let ignoreSpellButton = makeBigButton(`Ignore this Spell`, `!cmaster --spell,confirm=false,key=${key}`)
-                makeAndSendMenu(`A new spell - ${spellName} - was detected<br>`+addSpellButton+ignoreSpellButton ,`New Spell Found`,`gm`)
+                makeAndSendMenu(`A new spell - ${HE(spellName)} - was detected<br>`+addSpellButton+ignoreSpellButton ,`New Spell Found`,`gm`)
 
             }  else if (condition) {
                 targetedSpell(key)
                 if (concentration.useConcentration && concentrate == true && condition.override == false) {
-                    let characterName
-                    if (status.sheet == 'OGL') {
-                        characterName = msg.content.match(/charname=([^\n{}]*[^"\n{}])/);
-                        characterName = RegExp.$1;
+                    let tokenObj = findCasterToken(characterId, characterName, msg.playerid)
+                    if (tokenObj) {
+                        addConditionToToken(tokenObj,'concentration',condition.duration,condition.direction,'Concentrating on ' +spellName)
+                    } else {
+                        makeAndSendMenu('Could not find a token for <b>' + HE(String(characterName || characterId || '?')) + '</b> to add Concentration.', '', 'gm')
                     }
-                    else if (status.sheet == 'Shaped') {
-                        characterName = msg.content.match(/{{character_name=([\w\d ]+[^"\n{}]?)/);
-                        characterName = RegExp.$1;
-                    }
-                    let characterID     = findObjs({ name: characterName, _type: 'character' }).shift().get('id')
-                    let tokenObj        = findObjs({ represents: characterID, _pageid:Campaign().get("playerpageid"), _type: 'graphic' })[0]
-                    addConditionToToken(tokenObj,'concentration',condition.duration,condition.direction,'Concentrating on ' +spellName)
                 }
             }
         }
@@ -2969,11 +3446,13 @@ var CombatMaster = CombatMaster || (function() {
             log('Add Spell')
             log(key)
         }
-        state[combatState].config.conditions[key] = state[combatState].spells[key]
-        let index = state[combatState].spells.indexOf(key);
-        if (index > -1) {
-            state[combatState].spells.splice(index, 1);
+        let spell = state[combatState].spells[key]
+        if (!spell) {
+            makeAndSendMenu('That spell is no longer waiting to be added. Cast it again.', 'Add Spell', 'gm');
+            return
         }
+        state[combatState].config.conditions[key] = spell
+        delete state[combatState].spells[key]
         sendConditionMenu(key);
     },
 
@@ -2983,7 +3462,10 @@ var CombatMaster = CombatMaster || (function() {
             log(key)
         }
 
-       state[combatState].ignores.push(key)
+       if (!state[combatState].ignores.includes(key)) {
+           state[combatState].ignores.push(key)
+       }
+       delete state[combatState].spells[key]
        makeAndSendMenu('Spell has been added to Ignore List','Spell Ignored','gm');
     },
 
@@ -3003,113 +3485,74 @@ var CombatMaster = CombatMaster || (function() {
 //*************************************************************************************************************
 //SPELLS
 //*************************************************************************************************************
-    handleConstitutionSave = function(obj, prev) {
+    handleConstitutionSave = async function(obj, prev) {
         if (debug) {
             log('Handle Constitution Save')
         }
 
-        let tokenID = obj.get('id')
-        let found = false
-        state[combatState].conditions.forEach((condition) => {
-            if (condition.id == tokenID && condition.key == 'concentration') {
-                found = true
-            }
-        })
+        if (!obj || !prev) {
+            return
+        }
 
+        let concentration = state[combatState].config.concentration
+        let bar           = String(concentration.woundBar || 'bar1').toLowerCase() + '_value'
+        let prevValue     = parseFloat(prev[bar])
+        let newValue      = parseFloat(obj.get(bar))
+
+        if (!Number.isFinite(prevValue) || !Number.isFinite(newValue) || newValue >= prevValue) {
+            return
+        }
+
+        let tokenID = obj.get('id')
+        let found   = state[combatState].conditions.some(condition => condition.id == tokenID && condition.key == 'concentration')
         if (!found) {
             return;
         }
 
-        let conditions = obj.get('statusmarkers').split(',')
-        let condition = state[combatState].conditions.map(id => obj.get('statusmarkers'))
-        let concentration = state[combatState].config.concentration
-        let bar = concentration.woundBar+'_value'
-        let target = concentration.notify
+        // D&D 2024: DC is 10 or half the damage (round down), whichever is higher, up to 30
+        let damage       = prevValue - newValue
+        let DC           = Math.min(30, Math.max(10, Math.floor(damage/2)))
+        let characterObj = getObj('character', obj.get('represents'))
+        let name         = HE(obj.get('name') || (characterObj && characterObj.get('name')) || 'Token')
+        let target       = concentration.notify
+        let contents
 
-        if(obj.get(bar) < prev[bar]) {
-            let calcDC = Math.floor((prev[bar] - obj.get(bar))/2)
-            let DC = (calcDC > 10) ? calcDC : 10
-            let conSave = parseInt(getAttrByName(obj.get('represents'), concentration.attribute, 'current')) || 0
-            let contents;
-
-            if(target === 'Character'){
-                contents = "Make a Concentration Check - <b>DC " + DC + "</b>.";
-                target = obj.get('name').split(' ').shift()
-            } else if(target === 'Everyone'){
-                contents = '<b>'+obj.get('name')+'</b> must make a Concentration Check - <b>DC ' + DC + '</b>.';
-                target = '';
-            }else{
-                contents = '<b>'+obj.get('name')+'</b> must make a Concentration Check - <b>DC ' + DC + '</b>.';
-                target = 'gm';
-            }
-            makeAndSendMenu(contents, '', target);
-            // if(concentration.autoRoll){
-            //     roll(obj.get('represents'), DC, conSave, obj.get('name'), target);
-            // }else{
-                // makeAndSendMenu(contents, '', target);
-            // }
-
-            // let length = checked.push(obj.get('represents'));
-            // setTimeout(() => {
-            //     checked.splice(length-1, 1);
-            // }, 1000);
+        if(target === 'Character'){
+            contents = "Make a Concentration Check - <b>DC " + DC + "</b>.";
+            target   = (characterObj) ? characterObj.get('name') : 'gm'
+        } else if(target === 'Everyone'){
+            contents = '<b>'+name+'</b> must make a Concentration Check - <b>DC ' + DC + '</b>.';
+            target   = '';
+        }else{
+            contents = '<b>'+name+'</b> must make a Concentration Check - <b>DC ' + DC + '</b>.';
+            target   = 'gm';
         }
+
+        let attribute = String(concentration.attribute || 'None')
+        if (!concentration.autoRoll || attribute === 'None' || attribute === '' || !characterObj) {
+            makeAndSendMenu(contents, '', target);
+            return
+        }
+
+        let saveBonus = await getSheetNumber(characterObj.id, attribute)
+        if (typeof saveBonus === 'undefined') {
+            warnMissingAttributes(characterObj, [attribute])
+            saveBonus = 0
+        }
+
+        sendChat('', '[[1d20+(' + saveBonus + ')]]', (ops) => {
+            let roll    = ops && ops[0] && ops[0].inlinerolls && ops[0].inlinerolls[0]
+            let total   = (roll && roll.results) ? roll.results.total : 0
+            let success = total >= DC
+            let result  = (success) ? '<span style="color:green">Success</span>' : '<span style="color:red">Failed</span>'
+
+            let text = contents + '<br>Roll: <b>' + total + '</b> (bonus ' + saveBonus + ') ' + result
+            makeAndSendMenu(text, 'Concentration Check', target)
+            if (target !== '' && target !== 'gm') {
+                makeAndSendMenu(text, 'Concentration Check', 'gm')
+            }
+        })
     },
-
-    // roll = (represents, DC, conSave, name, target) => {
-    //     sendChat(script_name, '[[1d20cf<'+(DC-con_save_mod-1)+'cs>'+(DC-con_save_mod-1)+'+'+con_save_mod+']]', results => {
-    //         let title = 'Concentration Save <br> <b style="font-size: 10pt; color: gray;">'+name+'</b>',
-    //             advantageRollResult;
-
-    //         let rollresult = results[0].inlinerolls[0].results.rolls[0].results[0].v;
-    //         let result = rollresult;
-
-    //         if(advantage){
-    //             advantageRollResult = randomInteger(20);
-    //             result = (rollresult <= advantageRollResult) ? advantageRollResult : rollresult;
-    //         }
-
-    //         let total = result + con_save_mod;
-
-    //         let success = total >= DC;
-
-    //         let result_text = (success) ? 'Success' : 'Failed',
-    //             result_color = (success) ? 'green' : 'red';
-
-    //         let rollResultString = (advantage) ? rollresult + ' / ' + advantageRollResult : rollresult;
-
-    //         let contents = ' \
-    //         <table style="width: 100%; text-align: left;"> \
-    //             <tr> \
-    //                 <th>DC</th> \
-    //                 <td>'+DC+'</td> \
-    //             </tr> \
-    //             <tr> \
-    //                 <th>Modifier</th> \
-    //                 <td>'+con_save_mod+'</td> \
-    //             </tr> \
-    //             <tr> \
-    //                 <th>Roll Result</th> \
-    //                 <td>'+rollResultString+'</td> \
-    //             </tr> \
-    //         </table> \
-    //         <div style="text-align: center"> \
-    //             <b style="font-size: 16pt;"> \
-    //                 <span style="border: 1px solid '+result_color+'; padding-bottom: 2px; padding-top: 4px;">[['+result+'+'+con_save_mod+']]</span><br><br> \
-    //                 '+result_text+' \
-    //             </b> \
-    //         </div>'
-    //         makeAndSendMenu(contents, title, target);
-
-    //         if(target !== '' && target !== 'gm'){
-    //             makeAndSendMenu(contents, title, 'gm');
-    //         }
-
-    //         if(!success){
-    //             removeMarker(represents);
-    //         }
-    //     });
-    // },
 
     inFight = function () {
         
@@ -3149,13 +3592,13 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     observeTokenChange = function(handler){
-        if(handler && _.isFunction(handler)){
+        if(typeof handler === 'function'){
             observers.tokenChange.push(handler);
         }
     },
 
     notifyObservers = function(event,obj,prev){
-        _.each(observers[event],function(handler){
+        (observers[event] || []).forEach(function(handler){
             handler(obj,prev);
         });
     },
@@ -3169,7 +3612,7 @@ var CombatMaster = CombatMaster || (function() {
 
         let turnorder =  getTurnorder()
 
-        if (obj.hasOwnProperty("id") && turnorder.length > 0) {
+        if (obj && obj.id && turnorder.length > 0) {
             if(getCurrentTurn().id === obj.get('id')){
                 changeMarker(obj);
             }
@@ -3234,9 +3677,9 @@ var CombatMaster = CombatMaster || (function() {
                 '"' : '&'+'quot'+';',
                 "&" : '&'+'amp'+';'
             },
-            re=new RegExp('('+_.map(_.keys(entities),esRE).join('|')+')','g');
+            re=new RegExp('('+Object.keys(entities).map(esRE).join('|')+')','g');
         return function(s){
-            return s.replace(re, function(c){ return entities[c] || c; });
+            return String(s).replace(re, function(c){ return entities[c] || c; });
         };
     }()),
 
@@ -3246,7 +3689,7 @@ var CombatMaster = CombatMaster || (function() {
 
     buildParty = function(){
 		var partyList = '|All,all';
-        _.each(findObjs({type:'player'}),player=>{
+        findObjs({type:'player'}).forEach(player=>{
             let who = getObj('player', player.id).get('displayname');
             if (playerIsGM(player.id)){
               who = 'gm'
@@ -3266,7 +3709,8 @@ var CombatMaster = CombatMaster || (function() {
         const combatDefaults = {
             conditions: [],
             ignores: [],
-            spells: [],
+            spells: {},
+            markerIds: {current: null, next: null},
 			config: {
                 command: 'cmaster',
 				duration: false,
@@ -3344,14 +3788,14 @@ var CombatMaster = CombatMaster || (function() {
 					useMessage: false,
 					access: 'None',
 					autoAddSpells: false,
-					sheet: 'OGL',
+					sheet: 'Auto',
 				},
 				concentration: {
 					useConcentration: false,
 					notify: 'GM',
 					autoAdd: false,
 					autoRoll: false,
-					woundBar: 'Bar1',
+					woundBar: 'bar1',
 					attribute: 'None'
 				},
 			    conditions: {
@@ -3882,7 +4326,7 @@ var CombatMaster = CombatMaster || (function() {
                 if(!state[combatState].config.turnorder.hasOwnProperty('characterRoundMacro')){
                     state[combatState].config.turnorder.characterRoundMacro = combatDefaults.config.turnorder.characterRoundMacro;
                 }
-                if(!state[combatState].config.turnorder.hasOwnProperty('allRoundMacrFhando')){
+                if(!state[combatState].config.turnorder.hasOwnProperty('allRoundMacro')){
                     state[combatState].config.turnorder.allRoundMacro = combatDefaults.config.turnorder.allRoundMacro;
                 }
             }
@@ -4004,8 +4448,16 @@ var CombatMaster = CombatMaster || (function() {
             state[combatState].ignores = [];
         }
 
-        if(!state[combatState].hasOwnProperty('spells')){
-            state[combatState].spells = [];
+        if(!state[combatState].spells || Array.isArray(state[combatState].spells)){
+            state[combatState].spells = {};
+        }
+
+        if(!state[combatState].markerIds){
+            state[combatState].markerIds = {current: null, next: null};
+        }
+
+        if(state[combatState].config.concentration && state[combatState].config.concentration.woundBar){
+            state[combatState].config.concentration.woundBar = String(state[combatState].config.concentration.woundBar).toLowerCase();
         }
 
         if(state[combatState].config.hasOwnProperty('conditions') && !reset){
@@ -4117,7 +4569,11 @@ var CombatMaster = CombatMaster || (function() {
         } else if (cmdDetails.details.export) {
             title = 'Export Menu'
         }
-        handout = findHandout(title)
+        handout = (title) ? findHandout(title) : []
+        if (!handout || !handout[0]) {
+            makeAndSendMenu('Help handout not found. Restart the API sandbox to rebuild the help handouts.', title || 'Help', 'gm')
+            return
+        }
         makeAndSendMenu(`<a href="http://journal.roll20.net/handout/${handout[0].id}">View Help</a>`,title,'gm')
     },
 
@@ -4192,15 +4648,15 @@ var CombatMaster = CombatMaster || (function() {
                     </p>
                     <h4><i>Started Combat (Green Bar)</i> - Icons in order from Left to Right </h4>
                     <ul>
-                        <li><b>Stop Combat </b>— Ends Combat and clears Turnorder.</li>
-                        <li><b>Hold Combat </b>— Sets Combat to Hold and saves off everything for a restart</li>
-                        <li><b>Previous Player </b>— Sets Active Player to previous player in Turnorder</li>
-                        <li><b>Next Player </b>— Sets Active Player to Next Player in Turnorder</li>
-                        <li><b>Pause Timer </b>— Pauses Timer. Click again to restart Timer</li>
-                        <li><b>Stop Timer </b>— Stops Timer. Clears Timer.  Can't be restarted until next Combat</li>
-                        <li><b>Show Conditions </b>— Shows all Conditions assigned to all Players & NPCs</li>
-                        <li><b>Sort Turnorder </b>— Sorts Turnorder in ascending sequence</li>
-                        <li><b>Setup  </b>— Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a></li>
+                        <li><b>Stop Combat </b>: Ends Combat and clears Turnorder.</li>
+                        <li><b>Hold Combat </b>: Sets Combat to Hold and saves off everything for a restart</li>
+                        <li><b>Previous Player </b>: Sets Active Player to previous player in Turnorder</li>
+                        <li><b>Next Player </b>: Sets Active Player to Next Player in Turnorder</li>
+                        <li><b>Pause Timer </b>: Pauses Timer. Click again to restart Timer</li>
+                        <li><b>Stop Timer </b>: Stops Timer. Clears Timer.  Can't be restarted until next Combat</li>
+                        <li><b>Show Conditions </b>: Shows all Conditions assigned to all Players & NPCs</li>
+                        <li><b>Sort Turnorder </b>: Sorts Turnorder in ascending sequence</li>
+                        <li><b>Setup  </b>: Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a></li>
                     </ul>`
         notes += buildMainConditions('https://s3.amazonaws.com/files.d20.io/images/133804430/JJ--U559pOgsd9UBpUb06g/original.png?15892970605',conditionID)
         notes += `</div>`
@@ -4217,8 +4673,8 @@ var CombatMaster = CombatMaster || (function() {
                     </p>
                     <h4><i>Start Combat (Red Bar)</i> - Icons in order from Left to Right </h4>
                     <ul>
-                        <li><b>Start Combat </b>— Starts up combat. Must have tokens selected if using CM to roll initiative.</li>
-                        <li><b>Setup </b>— Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a>.</li>
+                        <li><b>Start Combat </b>: Starts up combat. Must have tokens selected if using CM to roll initiative.</li>
+                        <li><b>Setup </b>: Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a>.</li>
                     </ul>`
         notes += buildMainConditions('https://s3.amazonaws.com/files.d20.io/images/133804645/pmJuadcB01opW3Lg8lyOYA/original.png?15892970725',conditionID)
         notes += `</div>`
@@ -4235,8 +4691,8 @@ var CombatMaster = CombatMaster || (function() {
                     </p>
                     <h4><i>Held Combat (Yellow Bar)</i> - Icons in order from Left to Right </h4>
                     <ul>
-                        <li><b>Start Combat </b>— Restarts Combat from where it was previous held</li>
-                        <li><b>Setup </b>— Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a>.</li>
+                        <li><b>Start Combat </b>: Restarts Combat from where it was previous held</li>
+                        <li><b>Setup </b>: Shows the <a href="http://journal.roll20.net/handout/${setupID}">Setup Menu</a>.</li>
                     </ul>`
         notes += buildMainConditions('https://s3.amazonaws.com/files.d20.io/images/133804415/0Te1DEzFMolSiIj7DfZfTw/original.png?15892970575', conditionID)
         notes += `</div>`
@@ -4247,18 +4703,18 @@ var CombatMaster = CombatMaster || (function() {
     buildMainConditions = function(image,conditionID) {
         let notes = `<h4><i>Conditions</i> - From Left to Right </h4>
                     <ul>
-                        <li><b>Icon </b>— The default or custom token marker assigned to the condition is displayed here. If the condition uses the Token Condition script, it will simply show "TC" here.</li>
-                        <li><b>Name </b>— The name of the condition.</li>
-                        <li><b>Add </b>— Add the condition to the selected token(s). Will use the conditions settings for Duration, Default, Override, and Messages. Will invoke any API commands and/or Macros assigned to the condition.</li>
-                        <li><b>Remove </b>— Removes the condition from the selected token(s).</li>
-                        <li><b>Favorite </b>— If a star is displayed, the condition will show in the favorites menu. If a globe is displayed, the condition will only show in the all conditions menu. Clicking on either the star or globe icon for each condition will toggle if it's a favorite or not.</li><li><b>Edit </b>— Shows the <a href="http://journal.roll20.net/handout/${conditionID}">Condition Menu</a> for that condition.</li>
+                        <li><b>Icon </b>: The default or custom token marker assigned to the condition is displayed here. If the condition uses the Token Condition script, it will simply show "TC" here.</li>
+                        <li><b>Name </b>: The name of the condition.</li>
+                        <li><b>Add </b>: Add the condition to the selected token(s). Will use the conditions settings for Duration, Default, Override, and Messages. Will invoke any API commands and/or Macros assigned to the condition.</li>
+                        <li><b>Remove </b>: Removes the condition from the selected token(s).</li>
+                        <li><b>Favorite </b>: If a star is displayed, the condition will show in the favorites menu. If a globe is displayed, the condition will only show in the all conditions menu. Clicking on either the star or globe icon for each condition will toggle if it's a favorite or not.</li><li><b>Edit </b>: Shows the <a href="http://journal.roll20.net/handout/${conditionID}">Condition Menu</a> for that condition.</li>
                     </ul>
                     <h4><i>Change View</i></h4>
                     <ul>
-                        <li><b>All </b>— Shows all Spells and Conditions</li>
-                        <li><b>Conditions </b>— Shows all Conditions (Condition Type = Condition)</li>
-                        <li><b>Spells </b>— Shows all Spells (Condition Type = Spell)</li>
-                        <li><b>Favorites </b>— Shows all Favorites</li>
+                        <li><b>All </b>: Shows all Spells and Conditions</li>
+                        <li><b>Conditions </b>: Shows all Conditions (Condition Type = Condition)</li>
+                        <li><b>Spells </b>: Shows all Spells (Condition Type = Spell)</li>
+                        <li><b>Favorites </b>: Shows all Favorites</li>
                     </ul>`
 
         return notes
@@ -4272,28 +4728,28 @@ var CombatMaster = CombatMaster || (function() {
                         <h4><i>Combat Setup</i></h4>
                         <ul>
                             <ul>
-                                <li><b><a href="http://journal.roll20.net/handout/${initiativeID}">Initiative</a></b> — Configure how CombatMaster will roll Initiative.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${turnorderID}">Turnorder</a></b> — Configure how the turnorder is managed.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${timerID}">Timer</a></b> — Configure a timer, its length, and how it is displayed.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${announceID}">Announce</a></b> — Configure how turns are announced in chat.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${macroID}">Macro &amp; API</a></b> — Configure substitution strings for use in macros and API commands.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${initiativeID}">Initiative</a></b>: Configure how CombatMaster will roll Initiative.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${turnorderID}">Turnorder</a></b>: Configure how the turnorder is managed.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${timerID}">Timer</a></b>: Configure a timer, its length, and how it is displayed.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${announceID}">Announce</a></b>: Configure how turns are announced in chat.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${macroID}">Macro &amp; API</a></b>: Configure substitution strings for use in macros and API commands.<br></li>
                             </ul>
                         </ul>
                         <h4><i>Status Setup</i></h4>
                         <ul>
                             <ul>
-                                <li><b><a href="http://journal.roll20.net/handout/${statusID}">Status</a></b> — Configure how conditions are managed and displayed.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${concentrationID}">Concentration</a></b> — Configure how Concentration is managed and displayed<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${conditionsID}">Conditions</a></b> — A list of all conditions in CombatMaster; here, you can edit existing conditions or add new ones.<br></li>
-                                <li><b><a href="http://journal.roll20.net/handout/${exportID}">Export</a></b> — Puts a configuration code in chat to copy so you can import your conditions and settings into another game with CombatMaster. Simply triple-click the code to select it entirely (this also avoids selecting anything outside the code block). Save it in a handout to easily transmogrify to other games, or save it as a file on your computer.<br></li>
-                                <li><b>Import </b>— Import your configuration from another game.<br><b>NOTE:</b> <i>If migrating from CombatMaster to another CombatMaster, it will copy the entire CombatMaster configuration.  If coming from CombatTracker, it will only copy the conditions and you’ll have to reconfigure everything else. Importing from StatusInfo is not supported.<br></i></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${statusID}">Status</a></b>: Configure how conditions are managed and displayed.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${concentrationID}">Concentration</a></b>: Configure how Concentration is managed and displayed<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${conditionsID}">Conditions</a></b>: A list of all conditions in CombatMaster; here, you can edit existing conditions or add new ones.<br></li>
+                                <li><b><a href="http://journal.roll20.net/handout/${exportID}">Export</a></b>: Puts a configuration code in chat to copy so you can import your conditions and settings into another game with CombatMaster. Simply triple-click the code to select it entirely (this also avoids selecting anything outside the code block). Save it in a handout to easily transmogrify to other games, or save it as a file on your computer.<br></li>
+                                <li><b>Import </b>: Import your configuration from another game.<br><b>NOTE:</b> <i>If migrating from CombatMaster to another CombatMaster, it will copy the entire CombatMaster configuration.  If coming from CombatTracker, it will only copy the conditions and you’ll have to reconfigure everything else. Importing from StatusInfo is not supported.<br></i></li>
                             </ul>
                         </ul>
                         <h4><i>Resets</i></h4>
                         <ul>
-                            <li><b>Reset </b>— This resets the entire session state. It defaults the conditions to D&amp;D 5e.<br></li>
-                            <li><b>Remove Ignores </b>— This Removes all Spells from the ignore list<br></li>
-                            <li><b>Clear Token Statuses</b>— This Removes all Conditions/Spells assigned to selected tokens<br></li>
+                            <li><b>Reset </b>: This resets the entire session state. It defaults the conditions to D&amp;D 5e.<br></li>
+                            <li><b>Remove Ignores </b>: This Removes all Spells from the ignore list<br></li>
+                            <li><b>Clear Token Statuses</b>: This Removes all Conditions/Spells assigned to selected tokens<br></li>
                         </ul>
                     </div>`
 
@@ -4308,16 +4764,16 @@ var CombatMaster = CombatMaster || (function() {
                         <h4><i>Initiative Setup</i></h4>
                         <ul>
                             <ul>
-                                <li><b>None </b>— CombatMaster may be configured to not roll initiative.  You can have each character roll initiative on their own.<br><b>NOTE: </b><i>If you choose to not roll initiative from CombatMaster, the turn order will need to be set before starting combat.</i></li>
-                                <li><b>CombatMaster </b>— CombatMaster has its own initiative roller. To use it, select the tokens involved in the encounter, then click the Start button in the Main Menu.<br></li>
+                                <li><b>None </b>: CombatMaster may be configured to not roll initiative.  You can have each character roll initiative on their own.<br><b>NOTE: </b><i>If you choose to not roll initiative from CombatMaster, the turn order will need to be set before starting combat.</i></li>
+                                <li><b>CombatMaster </b>: CombatMaster has its own initiative roller. To use it, select the tokens involved in the encounter, then click the Start button in the Main Menu.<br></li>
                                 <ul>
-                                    <li><b>Roll Each Round </b>— Rerolls initiative at the end of each round.<br></li>
-                                    <li><b>Initiative Attr </b>— Accepts a comma delimited list of attributes that make up initiative. The attribute name must match the attribute names in the character sheet.</li>
-                                    <li><b>Initiative Die </b>— Set the type of dice that CombatMaster will roll for each character.<br></li>
-                                    <li><b>Show Initiative in Chat </b>— Displays the initiative rolls in chat.<br></li>
+                                    <li><b>Roll Each Round </b>: Rerolls initiative at the end of each round.<br></li>
+                                    <li><b>Initiative Attr </b>: Accepts a comma delimited list of attributes that make up initiative. The attribute name must match the attribute names in the character sheet.</li>
+                                    <li><b>Initiative Die </b>: Set the type of dice that CombatMaster will roll for each character.<br></li>
+                                    <li><b>Show Initiative in Chat </b>: Displays the initiative rolls in chat.<br></li>
                                 </ul>
-                                <li><b>Group-Init </b>— Calls on GroupInitiative to build the turnorder when you click the Start button in the Main Menu.<br><b>NOTE: </b><i>If you choose Group-Init, the GroupInitiative script must be installed in your game and configured outside of CombatMaster.</i></li><ul><li><b>Roll Each Round </b>— Rerolls initiative at the end of each round.</li>
-                                <li><b>Target Tokens </b>— Not functional yet></li>
+                                <li><b>Group-Init </b>: Calls on GroupInitiative to build the turnorder when you click the Start button in the Main Menu.<br><b>NOTE: </b><i>If you choose Group-Init, the GroupInitiative script must be installed in your game and configured outside of CombatMaster.</i></li><ul><li><b>Roll Each Round </b>: Rerolls initiative at the end of each round.</li>
+                                <li><b>Target Tokens </b>: Not functional yet</li>
                             </ul>
                         </ul>
                     </div>`
@@ -4333,10 +4789,10 @@ var CombatMaster = CombatMaster || (function() {
                         <h4><i>Turnorder Setup</i></h4>
                         <ul>
                             <ul>
-                                <li><b>Sort Turnorder </b>— Sorts the turnorder in descending sequence (only) once created.<br></li>
-                                <li><b>Center Map on Token </b>— Will center the map for all players on the token currently active in the turnorder using the Ping function. This will not center the map if the token is on the GM Layer.<br></li>
-                                <li><b>Use Marker </b>— Determines if the marker is visible to players or always stays on the GM Layer. If visible, the marker will only move to the GM Layer if a token in the turnorder is on the GM Layer. It will do switch layers before moving to that token, and after moving to the next token, so as not to give away the position of any tokens hidden from players.<br></li><li><b>Marker Type </b>— Set to External URL (default) or can be set to Token Marker.  If Token Marker is selected a suitable token must be uploaded to your game.</li><li><b>Marker </b>— A thumbnail of what will be used to highlight the current active character.</li><li><b>Use Next Marker </b>— If set to true will display another marker around the player that is next in the turnorder.  If set to false, then the next player up is not highlighted.</li>
-                                <li><b>Use Next Marker </b>— A thumbnail of what will be used to highlight the next active character. Set to None if you don't need it</li>
+                                <li><b>Sort Turnorder </b>: Sorts the turnorder in descending sequence (only) once created.<br></li>
+                                <li><b>Center Map on Token </b>: Will center the map for all players on the token currently active in the turnorder using the Ping function. This will not center the map if the token is on the GM Layer.<br></li>
+                                <li><b>Use Marker </b>: Determines if the marker is visible to players or always stays on the GM Layer. If visible, the marker will only move to the GM Layer if a token in the turnorder is on the GM Layer. It will do switch layers before moving to that token, and after moving to the next token, so as not to give away the position of any tokens hidden from players.<br></li><li><b>Marker Type </b>: Set to External URL (default) or can be set to Token Marker.  If Token Marker is selected a suitable token must be uploaded to your game.</li><li><b>Marker </b>: A thumbnail of what will be used to highlight the current active character.</li><li><b>Use Next Marker </b>: If set to true will display another marker around the player that is next in the turnorder.  If set to false, then the next player up is not highlighted.</li>
+                                <li><b>Use Next Marker </b>: A thumbnail of what will be used to highlight the next active character. Set to None if you don't need it</li>
                             </ul>
                         </ul>`
             notes +=    buildExternalCallMenu('<b>Beginning of Each Round</b>')
@@ -4350,17 +4806,17 @@ var CombatMaster = CombatMaster || (function() {
         let notes = `<h4><i>${title}</i></h4>
                      <h5><i> Set various external calls which will be invoked</i></h5>
                     <ul>
-                        <li><b>API </b>— Must be a full API command. You must use brackets {{ and }} around the command and around each parameter when entering the command. Any inline rolls must be written like [#[1d6]#] instead of [[1d6]].</li>
-                        <li><b>Roll20AM </b>— Must be a full Roll20AM command. You must use brackets {{ and }} around the command and around each parameter when entering the command.</li>
-                        <li><b>FX </b>— Must be a valid FX command.</li>`
+                        <li><b>API </b>: Must be a full API command. You must use brackets {{ and }} around the command and around each parameter when entering the command. Any inline rolls must be written like [#[1d6]#] instead of [[1d6]].</li>
+                        <li><b>Roll20AM </b>: Must be a full Roll20AM command. You must use brackets {{ and }} around the command and around each parameter when entering the command.</li>
+                        <li><b>FX </b>: Must be a valid FX command.</li>`
         if (round) {
-            notes +=    `<li><b>Characters Macro </b>— This uses a global macro substituting in all player characters on the map. Follows other macro rules (see below)</li>
-                         <li><b>All Tokens Macro </b>— This uses a global macro substituting in all tokens on the map. Follows other macro rules (see below)</li>`
+            notes +=    `<li><b>Characters Macro </b>: This uses a global macro substituting in all player characters on the map. Follows other macro rules (see below)</li>
+                         <li><b>All Tokens Macro </b>: This uses a global macro substituting in all tokens on the map. Follows other macro rules (see below)</li>`
         } else {
-            notes +=    `<li><b>Macro </b>— Must be the full macro name (without the #). Any inline rolls within the macro must be written like [#[1d6]#] instead of [[1d6]].</li>`
+            notes +=    `<li><b>Macro </b>: Must be the full macro name (without the #). Any inline rolls within the macro must be written like [#[1d6]#] instead of [[1d6]].</li>`
         }
         if (condition) {
-            notes +=    `<li><b>Persistent Macro</b> — Determines if the assigned macro is repeated at the start of an affected token's turn.`
+            notes +=    `<li><b>Persistent Macro</b>: Determines if the assigned macro is repeated at the start of an affected token's turn.`
         }
         notes +=    `</ul>`
 
@@ -4374,12 +4830,12 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Timer Setup</i></h4>
                         <ul>
-                            <li><b>Turn Timer </b>— Setting to true turns on the timer. The timer displays a red second by second countdown under the current active token in turnorder.<br>&lt;Image of a token with the timer below it&gt;<br></li>
-                            <li><b>Time </b>— Determine the total time in seconds that the active token has to complete the turn.<br></li><li><b>Skip Turn </b>— Automatically advances to the next turn when the timer reaches 0.<br></li>
-                            <li><b>Send to Chat </b>— Sends intermittent alerts to chat when the timer starts, when it reaches the halfway point, when it reaches 10 seconds, and when it reaches 5 seconds.<br></li>
-                            <li><b>Show on Token </b>— Choose whether to display the timer underneath the active token.<br></li>
-                            <li><b>Token Font </b>— Set the font for the displayed timer.<br></li>
-                            <li><b>Token Font Size </b>—  Set the font size for the displayed timer.</li>
+                            <li><b>Turn Timer </b>: Setting to true turns on the timer. The timer displays a red second by second countdown under the current active token in turnorder.<br>&lt;Image of a token with the timer below it&gt;<br></li>
+                            <li><b>Time </b>: Determine the total time in seconds that the active token has to complete the turn.<br></li><li><b>Skip Turn </b>: Automatically advances to the next turn when the timer reaches 0.<br></li>
+                            <li><b>Send to Chat </b>: Sends intermittent alerts to chat when the timer starts, when it reaches the halfway point, when it reaches 10 seconds, and when it reaches 5 seconds.<br></li>
+                            <li><b>Show on Token </b>: Choose whether to display the timer underneath the active token.<br></li>
+                            <li><b>Token Font </b>: Set the font for the displayed timer.<br></li>
+                            <li><b>Token Font Size </b>:  Set the font size for the displayed timer.</li>
                         </ul>
                     </div>`
 
@@ -4393,19 +4849,19 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Announcements Setup</i></h4>
                         <ul>
-                            <li><b>Announce Rounds </b>— Sends a message to chat when a new round has started.</li>
-                            <li><b>Announce Turns </b>— Sends a message to chat with the current active token if it is not on the GM Layer, plus any assigned conditions or messages.<br>
+                            <li><b>Announce Rounds </b>: Sends a message to chat when a new round has started.</li>
+                            <li><b>Announce Turns </b>: Sends a message to chat with the current active token if it is not on the GM Layer, plus any assigned conditions or messages.<br>
                                 <ul>
                                     <li><img src="https://s3.amazonaws.com/files.d20.io/images/152224865/IupB8psepZNaKPSkDB1UhA/original.png?15954302265"></li>
-                                    <li><b>Down Arrow Icon </b>— Delays Player Turn.</li>
-                                    <li><b>CheckBox Icon </b>— Ends Player Turn.</li>
-                                    <li><b>Condition Name </b>— Click on it to view Condition Description.</li>
-                                    <li><b>Trashcan Icon </b>— Click on it to remove Condition from Token.</li>
+                                    <li><b>Down Arrow Icon </b>: Delays Player Turn.</li>
+                                    <li><b>CheckBox Icon </b>: Ends Player Turn.</li>
+                                    <li><b>Condition Name </b>: Click on it to view Condition Description.</li>
+                                    <li><b>Trashcan Icon </b>: Click on it to remove Condition from Token.</li>
                                 </ul>
                             </li>
-                            <li><b>Whisper GM Only </b>— Choose whether all announcements are only sent to the GM.<br></li>
-                            <li><b>Shorten Long Names </b>— Shortens the token name as displayed in the turn announcement.<br></li>
-                            <li><b>Show NPC Conditions </b>— Choose whether NPC turn announcements are only sent to the GM.<br></li>
+                            <li><b>Whisper GM Only </b>: Choose whether all announcements are only sent to the GM.<br></li>
+                            <li><b>Shorten Long Names </b>: Shortens the token name as displayed in the turn announcement.<br></li>
+                            <li><b>Show NPC Conditions </b>: Choose whether NPC turn announcements are only sent to the GM.<br></li>
                         </ul>
                     </div>`
         handout.set({notes:notes});
@@ -4418,10 +4874,10 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Macro & API Setup</i></h4>
                         <ul>
-                            <li><b>Type </b>— The type of call being substituted.<br></li>
-                            <li><b>String </b>— The substitution string you have set up, for use in API commands and macros.<br></li>
-                            <li><b>Delete </b>— Delete the substitution on this line.<br></li>
-                            <li><b>Add Substitution </b>— Create a new substitution string.<br></li>
+                            <li><b>Type </b>: The type of call being substituted.<br></li>
+                            <li><b>String </b>: The substitution string you have set up, for use in API commands and macros.<br></li>
+                            <li><b>Delete </b>: Delete the substitution on this line.<br></li>
+                            <li><b>Add Substitution </b>: Create a new substitution string.<br></li>
                         </ul>
                     </div>`
         handout.set({notes:notes});
@@ -4434,13 +4890,13 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Status Setup</i></h4>
                         <ul>
-                            <li><b>Whisper GM Only </b>— Choose whether condition descriptions are only sent to the GM.<br></li>
-                            <li><b>Player Allowed Changes </b>— When this is turned on, the player active in the turnorder receives a Menu where they can add or remove conditions from their token.<br></li>
-                            <li><b>Send Changes to Chat </b>— Choose whether condition descriptions are sent to chat when a condition is added to a token.<br></li>
-                            <li><b>Clear Conditions on Close </b>— Choose whether stopping combat removes conditions from all tokens.<br></li>
-                            <li><b>Use Messages </b>— Enables messages to be included with conditions; will query for a message whenever a condition is added to a token.<br></li>
-                            <li><b>Auto Add Spells </b>— Enables Combat Master to detect spells and add them to Combat Master.  Note: Not all spells can be detected due to programming of that sheet<br></li>
-                            <li><b>Sheet </b>— Current Supported Sheets (OGL, Shaped, PF2, PF1)<br></li>
+                            <li><b>Whisper GM Only </b>: Choose whether condition descriptions are only sent to the GM.<br></li>
+                            <li><b>Player Allowed Changes </b>: When this is turned on, the player active in the turnorder receives a Menu where they can add or remove conditions from their token.<br></li>
+                            <li><b>Send Changes to Chat </b>: Choose whether condition descriptions are sent to chat when a condition is added to a token.<br></li>
+                            <li><b>Clear Conditions on Close </b>: Choose whether stopping combat removes conditions from all tokens.<br></li>
+                            <li><b>Use Messages </b>: Enables messages to be included with conditions; will query for a message whenever a condition is added to a token.<br></li>
+                            <li><b>Auto Add Spells </b>: Enables Combat Master to detect spells and add them to Combat Master.  Note: Not all spells can be detected due to programming of that sheet<br></li>
+                            <li><b>Sheet </b>: Auto (D&amp;D 2014 and D&amp;D 2024), DnD2024, OGL (D&amp;D 2014), Shaped, PF2. The D&amp;D 2024 sheet needs the Experimental API sandbox.<br></li>
                         </ul>
                     </div>`
         handout.set({notes:notes});
@@ -4453,13 +4909,12 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Concentration Setup</i></h4>
                         <ul>
-                            <li><b>Use Concentration </b>— Enables Concentration process<br></li>
-                            <li><b>Add Marker </b>— Automatically adds your concentration marker to token.  Concentration spell has to exist in Combat Master<br></li>
-                            <li><b>Check for Save </b>— Notifies that a save is needed when damage is applies and concentration exists on token<br></li>
-                            <li><b>Notify </b>— Notify everyone or GM when concentration save is needed<br></li>
-                            <li><b>Wound Bar </b>— Identifies which bar in the token is tracking wounds for purposes of concentration save and notification<br></li>
-                            <li><b>Auto Add Spells </b>— Enables Combat Master to detect spells and add them to Combat Master.  Note: Not all spells can be detected due to programming of that sheet<br></li>
-                            <li><b>Sheet </b>— Current Supported Character Sheet (OGL, Shaped, PF2, PF1)<br></li>
+                            <li><b>Use Concentration </b>: Enables Concentration process<br></li>
+                            <li><b>Add Marker </b>: Automatically adds your concentration marker to token.  Concentration spell has to exist in Combat Master<br></li>
+                            <li><b>Check for Save </b>: Notifies that a save is needed when damage is applies and concentration exists on token<br></li>
+                            <li><b>Notify </b>: Notify everyone or GM when concentration save is needed<br></li>
+                            <li><b>Wound Bar </b>: Identifies which bar in the token is tracking wounds for purposes of concentration save and notification<br></li>
+                            <li><b>Attribute </b>: Sheet value with the Constitution save bonus. If set, the save is rolled automatically. Works with D&amp;D 2014 and D&amp;D 2024 sheets (2024 needs the Experimental API sandbox).<br></li>
                         </ul>
                     </div>`
         handout.set({notes:notes});
@@ -4472,9 +4927,9 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Conditions Menu</i></h4>
                         <ul>
-                            <li><b>Icon </b>— The default or custom token marker assigned to the condition is displayed here. If the condition uses the TokenCondition script, it will simply show "TC" here.</li><li><b>Name </b>— The name of the condition.</li>
-                            <li><b>Edit </b>— Shows the <a href="http://journal.roll20.net/handout/-M5yiGl9bj-bn0V-72pd">Condition Editing Menu</a> for that condition.</li>
-                            <li><b>Add Condition </b>— Create a new condition. You will first be prompted for a condition name, then it will show you the new condition's Editing Menu.<br></li>
+                            <li><b>Icon </b>: The default or custom token marker assigned to the condition is displayed here. If the condition uses the TokenCondition script, it will simply show "TC" here.</li><li><b>Name </b>: The name of the condition.</li>
+                            <li><b>Edit </b>: Shows the <a href="http://journal.roll20.net/handout/-M5yiGl9bj-bn0V-72pd">Condition Editing Menu</a> for that condition.</li>
+                            <li><b>Add Condition </b>: Create a new condition. You will first be prompted for a condition name, then it will show you the new condition's Editing Menu.<br></li>
                         </ul>
                     </div>`
         handout.set({notes:notes});
@@ -4488,26 +4943,26 @@ var CombatMaster = CombatMaster || (function() {
                         </p>
                         <h4><i>Condition Menu</i></h4>
                         <ul>
-                            <li><b>Name </b>— The name of the condition<br></li>
-                            <li><b>Type </b>— Determines if a Spell or Condition.  Set to spell if using concentration<br></li>
-                            <li><b>Icon Type </b>— Determines what options are presented when clicking <b>Icon</b>.<br></li>
+                            <li><b>Name </b>: The name of the condition<br></li>
+                            <li><b>Type </b>: Determines if a Spell or Condition.  Set to spell if using concentration<br></li>
+                            <li><b>Icon Type </b>: Determines what options are presented when clicking <b>Icon</b>.<br></li>
                             <ul>
-                                <li>CombatMaster — Lets you pick from Roll20 default markers only.</li>
-                                <li>TokenMarker — Requires the libTokenMarker script; lets you pick from any marker sets in your game, including Roll20 default.<br><b>NOTE:</b> <i>Token marker names with spaces may cause issues, it is recommended to avoid spaces in token marker names.</i></li>
-                                <li>TokenCondition — Requires the TokenCondition script; lets you pick from any characters used by this script.<br></li>
+                                <li>CombatMaster: Lets you pick from Roll20 default markers only.</li>
+                                <li>TokenMarker: Requires the libTokenMarker script; lets you pick from any marker sets in your game, including Roll20 default.<br><b>NOTE:</b> <i>Token marker names with spaces may cause issues, it is recommended to avoid spaces in token marker names.</i></li>
+                                <li>TokenCondition: Requires the TokenCondition script; lets you pick from any characters used by this script.<br></li>
                             </ul>
-                            <li><b>Icon </b>— Thumbnail of the marker that will be used by the current condition; click to change (options based on your selection for <b>Icon Type</b>). If using TokenCondition for the condition, thumbnail will be replaced by "TC".<br></li>
-                            <li><b>Duration </b>— Defines the length of the condition before it is removed.<br></li>
-                            <li><b>Direction </b>— Defines how quickly the duration is reduced each round.  Set to a negative number to reduce the duration, positive number if it increases over time, or 0.  If 0, it remains permanently on the token until manually removed.</li>
-                            <li><b>Override </b>— Determines if the direction/duration can be overridden when assigning the condition to the token.  For conditions that do not change, set override to  false and the direction/duration roll queries do not display when assigning the condition.</li>
-                            <li><b>Favorites </b>— Determines if the condition shows in the Favorites menu.  This can also be set on the Main Menu.  The Favorites menu shows only conditions marked as Favorite.<br></li>
-                            <li><b>Message </b>— Set a default message that will show along with the condition. It can be overridden when assigning the condition. If you have commas in the description, use brackets {{ and }} around it when entering it.<br></li>
-                            <li><b>Targeted </b>— Determines if the condition applies to another token; useful for effects that affect one or more targets but have a duration based on the caster's turn. Applies the condition's marker to the target token(s). Rather than using the @{target} feature, the GM will see the following message in chat:<br>&lt;Image of the Select Targets message&gt;<br></li>
-                            <li><b>Concentration </b>— Set to true if a Spell and Spell causes concentration on the caster<br></li>
-                            <li><b>Add API </b>— Displays the Add API Menu.  Click on this if you want an external API call when adding a condition to a token(s)<br></li>
-                            <li><b>Remove API </b>— Displays the Remove API Menu.  Click on this if you want an external API call when removing a condition from a token(s)<br></li>
-                            <li><b>Edit Description </b>— Add a description to condition.  Use {{ }} if there's periods or commas in descrription<br></li>
-                            <li><b>Delete Condition </b>— Delete the condition from CombatMaster.<br></li>
+                            <li><b>Icon </b>: Thumbnail of the marker that will be used by the current condition; click to change (options based on your selection for <b>Icon Type</b>). If using TokenCondition for the condition, thumbnail will be replaced by "TC".<br></li>
+                            <li><b>Duration </b>: Defines the length of the condition before it is removed.<br></li>
+                            <li><b>Direction </b>: Defines how quickly the duration is reduced each round.  Set to a negative number to reduce the duration, positive number if it increases over time, or 0.  If 0, it remains permanently on the token until manually removed.</li>
+                            <li><b>Override </b>: Determines if the direction/duration can be overridden when assigning the condition to the token.  For conditions that do not change, set override to  false and the direction/duration roll queries do not display when assigning the condition.</li>
+                            <li><b>Favorites </b>: Determines if the condition shows in the Favorites menu.  This can also be set on the Main Menu.  The Favorites menu shows only conditions marked as Favorite.<br></li>
+                            <li><b>Message </b>: Set a default message that will show along with the condition. It can be overridden when assigning the condition. If you have commas in the description, use brackets {{ and }} around it when entering it.<br></li>
+                            <li><b>Targeted </b>: Determines if the condition applies to another token; useful for effects that affect one or more targets but have a duration based on the caster's turn. Applies the condition's marker to the target token(s). Rather than using the @{target} feature, the GM will see the following message in chat:<br>&lt;Image of the Select Targets message&gt;<br></li>
+                            <li><b>Concentration </b>: Set to true if a Spell and Spell causes concentration on the caster<br></li>
+                            <li><b>Add API </b>: Displays the Add API Menu.  Click on this if you want an external API call when adding a condition to a token(s)<br></li>
+                            <li><b>Remove API </b>: Displays the Remove API Menu.  Click on this if you want an external API call when removing a condition from a token(s)<br></li>
+                            <li><b>Edit Description </b>: Add a description to condition.  Use {{ }} if there's periods or commas in descrription<br></li>
+                            <li><b>Delete Condition </b>: Delete the condition from CombatMaster.<br></li>
                         </ul>
                      </div>`
 
@@ -4548,12 +5003,15 @@ var CombatMaster = CombatMaster || (function() {
     },
 
     checkInstall = function () {
-        if(!_.has(state, combatState)){
-            state[combatState] = state[combatState] || {};
+        if(!state[combatState]){
+            state[combatState] = {};
         }
         setDefaults();
         buildHelp();
-        log(script_name + ' Ready! Command: !cmaster --main');
+        log(script_name + ' v' + version + ' Ready! Command: !cmaster --main');
+        if (typeof getSheetItem !== 'function') {
+            log(script_name + ': getSheetItem is not available. D&D 2024 (Beacon) sheets need the Experimental API sandbox.');
+        }
     },
 
     registerEventHandlers = function() {
@@ -4565,7 +5023,11 @@ var CombatMaster = CombatMaster || (function() {
         on('change:graphic:top', handleGraphicMovement);
         on('change:graphic:left', handleGraphicMovement);
         on('change:graphic:layer', handleGraphicMovement);
-        on('change:graphic:'+state[combatState].config.concentration.woundBar+'_value', handleConstitutionSave);
+        ['bar1','bar2','bar3'].forEach(bar => {
+            on('change:graphic:'+bar+'_value', (obj, prev) => {
+                handleConstitutionSave(obj, prev).catch(err => reportError('Concentration Check', err));
+            });
+        });
 
         if('undefined' !== typeof DeathTracker && DeathTracker.ObserveTokenChange){
             DeathTracker.ObserveTokenChange(function(obj,prev) {
